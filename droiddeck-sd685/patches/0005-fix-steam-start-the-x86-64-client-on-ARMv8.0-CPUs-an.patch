@@ -1,0 +1,601 @@
+From 401a2e8d29f04cda83e90c8681c3e31f32176aa5 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 20 Nov 2026 20:41:50 +0000
+Subject: [PATCH 5/8] fix(steam): start the x86-64 client on ARMv8.0 CPUs, and
+ cap low-tier sessions at 60 Hz
+
+- CpuFeatures reads HWCAP_ATOMICS from /proc/self/auxv (then /proc/cpuinfo); a CPU known
+  to lack it always gets the x86-64 client, the settings offer only that client with the
+  reason, and a SIGILL on the arm64 client names it.
+- LowTierDevice (ARMv8.0 CPU or Adreno 605-620) starts the session refresh cap at 60 Hz;
+  Display settings choose 60 Hz or the panel maximum, and Reset settings clears it.
+- xCloud's native player starts without DDFG frame generation there; a saved choice wins.
+- The device report lists the CPU class, the Steam client in effect and the refresh cap.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../droiddeck/launcher/FrontEndActivity.kt    |  6 +-
+ .../com/droiddeck/launcher/SessionActivity.kt | 15 ++--
+ .../droiddeck/launcher/core/CpuFeatures.kt    | 62 +++++++++++++++++
+ .../droiddeck/launcher/core/DeviceReport.kt   |  4 ++
+ .../droiddeck/launcher/core/LowTierDevice.kt  | 17 +++++
+ .../launcher/session/SessionPrefs.kt          | 22 +++++-
+ .../launcher/session/SettingsReset.kt         |  2 +-
+ .../launcher/stores/xbox/XboxCloudSettings.kt | 12 +++-
+ .../launcher/ui/ModeSettingsDialog.kt         | 28 ++++++--
+ app/src/main/res/values-b+es+419/strings.xml  |  6 ++
+ app/src/main/res/values-es/strings.xml        |  6 ++
+ app/src/main/res/values/strings.xml           |  6 ++
+ .../launcher/core/CpuFeaturesTest.kt          | 69 +++++++++++++++++++
+ .../session/LowTierSessionPrefsTest.kt        | 49 +++++++++++++
+ 14 files changed, 289 insertions(+), 15 deletions(-)
+ create mode 100644 app/src/main/java/com/droiddeck/launcher/core/CpuFeatures.kt
+ create mode 100644 app/src/main/java/com/droiddeck/launcher/core/LowTierDevice.kt
+ create mode 100644 app/src/test/java/com/droiddeck/launcher/core/CpuFeaturesTest.kt
+ create mode 100644 app/src/test/java/com/droiddeck/launcher/session/LowTierSessionPrefsTest.kt
+
+diff --git a/app/src/main/java/com/droiddeck/launcher/FrontEndActivity.kt b/app/src/main/java/com/droiddeck/launcher/FrontEndActivity.kt
+index 6bdfbbc..5d6567a 100644
+--- a/app/src/main/java/com/droiddeck/launcher/FrontEndActivity.kt
++++ b/app/src/main/java/com/droiddeck/launcher/FrontEndActivity.kt
+@@ -193,6 +193,7 @@ class FrontEndActivity : ComponentActivity() {
+     private var directAudio by mutableStateOf(false)
+     private var picturePosition by mutableStateOf("center")
+     private var stretch16x9 by mutableStateOf(false)
++    private var refreshCap by mutableStateOf(0)
+     private var orientation by mutableStateOf(android.content.pm.ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE)
+     private var launcherOrientation by mutableStateOf(android.content.pm.ActivityInfo.SCREEN_ORIENTATION_USER)
+     private var launcherFullscreen by mutableStateOf(true)
+@@ -2404,6 +2405,7 @@ class FrontEndActivity : ComponentActivity() {
+                 directAudio = if (mode == SessionService.MODE_STEAM) directAudio else null,
+                 picturePosition = if (mode == SessionService.MODE_STEAM) picturePosition else null,
+                 stretch16x9 = if (mode == SessionService.MODE_STEAM) stretch16x9 else null,
++                refreshCap = refreshCap,
+                 mic = if (mode == SessionService.MODE_STEAM) mic else null,
+                 gameStorage = if (mode == SessionService.MODE_STEAM) gameStorage else null,
+                 storageOptions = storageOptions,
+@@ -2464,6 +2466,7 @@ class FrontEndActivity : ComponentActivity() {
+                 onDirectAudio = { on -> SessionPrefs.setDirectAudio(this, on); directAudio = on },
+                 onPicturePosition = { value -> SessionPrefs.setPicturePosition(this, value); picturePosition = value },
+                 onStretch16x9 = { on -> SessionPrefs.setStretch16x9(this, on); stretch16x9 = on },
++                onRefreshCap = { hz -> SessionPrefs.setRefreshCap(this, hz); refreshCap = SessionPrefs.refreshCap(this) },
+                 onMic = { on ->
+                     SessionPrefs.setMicEnabled(this, on)
+                     mic = on
+@@ -2506,7 +2509,7 @@ class FrontEndActivity : ComponentActivity() {
+                 onSteamRepair = { steamRepairQueued = SteamRepair.queue(this) },
+                 onSteamClientArch = { id ->
+                     SessionPrefs.setSteamClientArch(this, id)
+-                    steamClientArch = id
++                    steamClientArch = SessionPrefs.steamClientArch(this)
+                     loadShaderPrecache(mode)
+                     refresh()
+                 },
+@@ -2722,6 +2725,7 @@ class FrontEndActivity : ComponentActivity() {
+         directAudio = SessionPrefs.directAudio(this)
+         picturePosition = SessionPrefs.picturePosition(this)
+         stretch16x9 = SessionPrefs.stretch16x9(this)
++        refreshCap = SessionPrefs.refreshCap(this)
+         mic = SessionPrefs.micEnabled(this)
+         refreshWifiDiscovery()
+         gameStorage = SessionPrefs.gameStorage(this)
+diff --git a/app/src/main/java/com/droiddeck/launcher/SessionActivity.kt b/app/src/main/java/com/droiddeck/launcher/SessionActivity.kt
+index 09ae785..873cf93 100644
+--- a/app/src/main/java/com/droiddeck/launcher/SessionActivity.kt
++++ b/app/src/main/java/com/droiddeck/launcher/SessionActivity.kt
+@@ -2373,21 +2373,24 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
+         val requested = display?.supportedModes?.firstOrNull { wanted != 0 && it.modeId == wanted }?.refreshRate
+         val running = display?.refreshRate?.takeIf { it > 1f }
+         val hz = listOfNotNull(requested, running).minOrNull() ?: 60f
+-        val mirrorCap = mirrorRefreshLimit().takeIf { it > 0 }?.toFloat() ?: Float.POSITIVE_INFINITY
+-        val capped = minOf(hz, PerfMode.peakRefreshCap(this), mirrorCap)
++        val limit = sessionRefreshLimit().takeIf { it > 0 }?.toFloat() ?: Float.POSITIVE_INFINITY
++        val capped = minOf(hz, PerfMode.peakRefreshCap(this), limit)
+         return if (capped > 1f) capped else 60f
+     }
+ 
+     private fun mirrorRefreshLimit(): Int =
+         GlassesRendering.mirrorRefreshLimit(glassesSettings, glasses, glassesScreen != null)
+ 
++    private fun sessionRefreshLimit(): Int =
++        SessionPrefs.refreshLimit(mirrorRefreshLimit(), if (glassesScreen == null) SessionPrefs.refreshCap(this) else 0)
++
+     private fun outputFpsLimit(): Int = outputFpsLimit(pipUi)
+ 
+     private fun outputFpsLimit(pip: Boolean): Int =
+         SessionPrefs.compositorFpsLimit(mirrorRefreshLimit(), if (noSteamSession()) SessionState.fpsLimit else 0, pip)
+ 
+     private fun applyOutputPacing() {
+-        Log.i(TAG, "perf: " + PerfMode.apply(this, outputFpsLimit(false), mirrorRefreshLimit()))
++        Log.i(TAG, "perf: " + PerfMode.apply(this, outputFpsLimit(false), sessionRefreshLimit()))
+         if (CompositorHost.isStarted) {
+             val hz = refreshHz()
+             val changed = kotlin.math.abs(SessionState.refreshHz - hz) > 0.1f
+@@ -2613,7 +2616,11 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
+                 EndHint(listOfNotNull(message, steamSetup.curlError).joinToString("\n"))
+             } else if (launchFailure == com.droiddeck.launcher.session.SessionLaunchFailure.STEAM_ILLEGAL_INSTRUCTION) {
+                 val message = getString(R.string.session_end_steam_sigill)
+-                val fallback = if (SessionState.steamClientArch == "arm64") getString(R.string.session_end_steam_try_x64) else null
++                val fallback = when {
++                    SessionState.steamClientArch != "arm64" -> null
++                    com.droiddeck.launcher.core.CpuFeatures.armv80Only() -> getString(R.string.session_end_steam_sigill_armv80)
++                    else -> getString(R.string.session_end_steam_try_x64)
++                }
+                 EndHint(listOfNotNull(message, fallback).joinToString("\n"))
+             } else if (launchFailure == com.droiddeck.launcher.session.SessionLaunchFailure.VULKAN_DEVICE_MISSING) {
+                 val gpu = com.droiddeck.launcher.gpu.GpuInfo.detect()
+diff --git a/app/src/main/java/com/droiddeck/launcher/core/CpuFeatures.kt b/app/src/main/java/com/droiddeck/launcher/core/CpuFeatures.kt
+new file mode 100644
+index 0000000..221075f
+--- /dev/null
++++ b/app/src/main/java/com/droiddeck/launcher/core/CpuFeatures.kt
+@@ -0,0 +1,62 @@
++package com.droiddeck.launcher.core
++
++import java.io.File
++import java.nio.ByteBuffer
++import java.nio.ByteOrder
++
++/**
++ * Whether the CPU has the ARMv8.1 LSE atomic instructions (HWCAP_ATOMICS).
++ *
++ * Valve's arm64 Steam client (libtier0_s.so's ThreadInterlockedIncrement is a bare `ldaddal`)
++ * and every arm64 Proton build (Valve's Makefile uses -march=armv8.2-a) use LSE atomics without a
++ * runtime check, so they stop with SIGILL on ARMv8.0 cores such as the Cortex-A53/A73 in the
++ * Snapdragon 6xx and 835 families. FEX needs only ARMv8.0 with FP and CRC32.
++ */
++object CpuFeatures {
++    enum class Lse { PRESENT, ABSENT, UNKNOWN }
++
++    private const val AT_NULL = 0L
++    private const val AT_HWCAP = 16L
++    private const val HWCAP_ATOMICS = 1L shl 8
++
++    internal fun lseFromAuxv(auxv: ByteArray?): Lse {
++        if (auxv == null || auxv.size < 16) return Lse.UNKNOWN
++        val buffer = ByteBuffer.wrap(auxv).order(ByteOrder.LITTLE_ENDIAN)
++        while (buffer.remaining() >= 16) {
++            val type = buffer.long
++            val value = buffer.long
++            if (type == AT_NULL) break
++            if (type == AT_HWCAP) return if ((value and HWCAP_ATOMICS) != 0L) Lse.PRESENT else Lse.ABSENT
++        }
++        return Lse.UNKNOWN
++    }
++
++    /** Every core's list must name `atomics`; no Features line at all says nothing either way. */
++    internal fun lseFromCpuInfo(cpuInfo: String?): Lse {
++        val lists = cpuInfo.orEmpty().lineSequence()
++            .filter { it.substringBefore(':').trim() == "Features" }
++            .map { line -> line.substringAfter(':').trim().split(Regex("\\s+")).filter(String::isNotEmpty).toSet() }
++            .toList()
++        if (lists.isEmpty()) return Lse.UNKNOWN
++        return if (lists.all { "atomics" in it }) Lse.PRESENT else Lse.ABSENT
++    }
++
++    internal fun combine(auxv: Lse, cpuInfo: Lse): Lse = if (auxv != Lse.UNKNOWN) auxv else cpuInfo
++
++    val lse: Lse by lazy {
++        if (System.getProperty("os.arch").orEmpty().let { it != "aarch64" && it != "arm64" }) return@lazy Lse.UNKNOWN
++        combine(
++            lseFromAuxv(runCatching { File("/proc/self/auxv").readBytes() }.getOrNull()),
++            lseFromCpuInfo(FileUtils.readString(File("/proc/cpuinfo"))),
++        )
++    }
++
++    /** True only when the CPU is known to lack LSE: absent or unreadable data keeps every arm64 path. */
++    fun armv80Only(): Boolean = lse == Lse.ABSENT
++
++    fun describe(): String = when (lse) {
++        Lse.PRESENT -> "ARMv8.1+ (LSE atomics)"
++        Lse.ABSENT -> "ARMv8.0 (no LSE atomics): Valve's arm64 Steam client and arm64 Proton cannot run"
++        Lse.UNKNOWN -> "not reported"
++    }
++}
+diff --git a/app/src/main/java/com/droiddeck/launcher/core/DeviceReport.kt b/app/src/main/java/com/droiddeck/launcher/core/DeviceReport.kt
+index cb0b948..9d5f168 100644
+--- a/app/src/main/java/com/droiddeck/launcher/core/DeviceReport.kt
++++ b/app/src/main/java/com/droiddeck/launcher/core/DeviceReport.kt
+@@ -149,6 +149,8 @@ object DeviceReport {
+         h("CPU and memory")
+         k("Cores", CpuCores.all.size)
+         k("CPU features", cpuFeaturesSummary(FileUtils.readString(File("/proc/cpuinfo")).orEmpty()))
++        k("CPU class", CpuFeatures.describe())
++        k("Low-tier defaults", LowTierDevice.detected)
+         b.append("Core ceilings          ")
+         b.append(CpuCores.all.joinToString(", ") { c ->
+             "cpu$c " + (CpuCores.maxGhz(c)?.let { String.format(Locale.US, "%.2f GHz", it) } ?: "?")
+@@ -258,6 +260,8 @@ object DeviceReport {
+         k("Runtime root", LinuxRuntime.rootDir(context).path)
+ 
+         h("Settings in effect")
++        k("Steam client", SessionPrefs.steamClientArch(context) + if (SessionPrefs.steamClientArchLocked()) " (ARMv8.0 CPU: arm64 client unavailable)" else "")
++        k("Session refresh cap", SessionPrefs.refreshCap(context).let { if (it > 0) "$it Hz" else "panel maximum" })
+         k("Client core override", SessionPrefs.clientCpusOverride(context))
+         k("  client cores", CpuCores.listOrAll(SessionPrefs.clientCpus(context)))
+         k("  game cores", CpuCores.restrictionOrEmpty(SessionPrefs.gameCpus(context)).ifEmpty { "every core" })
+diff --git a/app/src/main/java/com/droiddeck/launcher/core/LowTierDevice.kt b/app/src/main/java/com/droiddeck/launcher/core/LowTierDevice.kt
+new file mode 100644
+index 0000000..f288b2f
+--- /dev/null
++++ b/app/src/main/java/com/droiddeck/launcher/core/LowTierDevice.kt
+@@ -0,0 +1,17 @@
++package com.droiddeck.launcher.core
++
++import com.droiddeck.launcher.gpu.GpuInfo
++
++/**
++ * Snapdragon 4xx/6xx-class hardware: an Adreno 6xx below the 630 (A605-A620), or any CPU without
++ * ARMv8.1 atomics. Only defaults follow from it; every setting it touches stays the user's choice.
++ */
++object LowTierDevice {
++    internal fun isLowTier(family: GpuInfo.Family, model: Int, armv80Only: Boolean): Boolean =
++        armv80Only || (family == GpuInfo.Family.A6XX && model in 600..629)
++
++    val detected: Boolean by lazy {
++        runCatching { GpuInfo.detect() }.getOrNull()
++            .let { gpu -> isLowTier(gpu?.family ?: GpuInfo.Family.NOT_ADRENO, gpu?.model ?: 0, CpuFeatures.armv80Only()) }
++    }
++}
+diff --git a/app/src/main/java/com/droiddeck/launcher/session/SessionPrefs.kt b/app/src/main/java/com/droiddeck/launcher/session/SessionPrefs.kt
+index c8e8155..0ef9549 100644
+--- a/app/src/main/java/com/droiddeck/launcher/session/SessionPrefs.kt
++++ b/app/src/main/java/com/droiddeck/launcher/session/SessionPrefs.kt
+@@ -656,6 +656,19 @@ object SessionPrefs {
+         prefs(context).edit().putString("gameCpus", list).apply()
+     }
+ 
++    /** Highest session refresh rate in Hz, 0 for the panel's own maximum. Low-tier SoCs start at 60. */
++    fun refreshCap(context: Context): Int =
++        prefs(context).getInt("refreshCap", defaultRefreshCap(com.droiddeck.launcher.core.LowTierDevice.detected))
++
++    internal fun defaultRefreshCap(lowTier: Boolean): Int = if (lowTier) 60 else 0
++
++    fun setRefreshCap(context: Context, hz: Int) {
++        prefs(context).edit().putInt("refreshCap", hz.coerceAtLeast(0)).apply()
++    }
++
++    /** The lowest of the limits that are set (above 0), or 0 when none is. */
++    internal fun refreshLimit(vararg limits: Int): Int = limits.filter { it > 0 }.minOrNull() ?: 0
++
+     fun noXalia(context: Context): Boolean = prefs(context).getBoolean("noXalia", true)
+ 
+     fun setNoXalia(context: Context, on: Boolean) {
+@@ -1090,7 +1103,14 @@ object SessionPrefs {
+             .onFailure { android.util.Log.e("GameEnvironment", "Could not update game environment", it) }
+     }
+ 
+-    fun steamClientArch(context: Context): String = prefs(context).getString("steamClientArch", null) ?: "arm64"
++    fun steamClientArch(context: Context): String =
++        effectiveSteamClientArch(prefs(context).getString("steamClientArch", null) ?: "arm64", com.droiddeck.launcher.core.CpuFeatures.armv80Only())
++
++    /** The arm64 client cannot start on an ARMv8.0 CPU (see CpuFeatures), so such a CPU always gets the x86-64 one. */
++    internal fun effectiveSteamClientArch(chosen: String, armv80Only: Boolean): String =
++        if (armv80Only && chosen != "x86_64") "x86_64" else chosen
++
++    fun steamClientArchLocked(): Boolean = com.droiddeck.launcher.core.CpuFeatures.armv80Only()
+ 
+     fun setSteamClientArch(context: Context, id: String) {
+         prefs(context).edit().putString("steamClientArch", id).apply()
+diff --git a/app/src/main/java/com/droiddeck/launcher/session/SettingsReset.kt b/app/src/main/java/com/droiddeck/launcher/session/SettingsReset.kt
+index 2146ac1..3d70723 100644
+--- a/app/src/main/java/com/droiddeck/launcher/session/SettingsReset.kt
++++ b/app/src/main/java/com/droiddeck/launcher/session/SettingsReset.kt
+@@ -21,7 +21,7 @@ object SettingsReset {
+         "stretch16x9", "picturePosition", "railLabels", "pcKeyboardSize", "pcKeyboardOpacity", "pcKeyboardHiddenKeys",
+         "gpuDriverMode", "androidDriver", "linuxDriver", "linuxDriver.steam", "linuxDriver.desktop",
+         "tuSysmem", "glThread", "noGlError", "zinkLazy", "mangoapp", "gpuClockPin", "gamescopeRealtime", "ramCapMb", "vramCapMb", "zramClient",
+-        "directAudio", "mic", "wifiDiscovery", "clientCpusOverride", "clientCpus", "gameCpus",
++        "directAudio", "mic", "wifiDiscovery", "clientCpusOverride", "clientCpus", "gameCpus", "refreshCap",
+         "noXalia", "fastSync", "fsyncFirst", "syncFallback", "prootNoSeccomp", "prootFastPath", "cursorComposite",
+         "guestHostname", "fexPreset", "forceSsbs", "logs", "gameDebugLogsEnabled", "enhancedDiagnosticsNext", "storageDiagnostics",
+         "upscaler", "upscaleSharpness", "screenEffects", "textureAnisotropy", "textureLodBias",
+diff --git a/app/src/main/java/com/droiddeck/launcher/stores/xbox/XboxCloudSettings.kt b/app/src/main/java/com/droiddeck/launcher/stores/xbox/XboxCloudSettings.kt
+index 247b1b0..475838f 100644
+--- a/app/src/main/java/com/droiddeck/launcher/stores/xbox/XboxCloudSettings.kt
++++ b/app/src/main/java/com/droiddeck/launcher/stores/xbox/XboxCloudSettings.kt
+@@ -59,8 +59,16 @@ data class XboxCloudSettings(
+         private const val PREFS = "xbox_cloud"
+         private const val KEY = "settings"
+ 
+-        fun load(context: Context): XboxCloudSettings =
+-            decode(context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getString(KEY, null))
++        fun load(context: Context): XboxCloudSettings {
++            val saved = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getString(KEY, null)
++            return withDeviceDefaults(decode(saved), saved, com.droiddeck.launcher.core.LowTierDevice.detected)
++        }
++
++        /** DDFG's optical flow costs an Adreno 6xx below the 630 more than the frames it adds; a saved choice wins. */
++        internal fun withDeviceDefaults(settings: XboxCloudSettings, saved: String?, lowTier: Boolean): XboxCloudSettings {
++            val chosen = saved != null && runCatching { JSONObject(saved).has("frameGen") }.getOrDefault(false)
++            return if (lowTier && !chosen) settings.copy(frameGen = XboxNativeVideo.FG_OFF) else settings
++        }
+ 
+         internal fun decode(text: String?): XboxCloudSettings = runCatching {
+             val json = JSONObject(text ?: return XboxCloudSettings())
+diff --git a/app/src/main/java/com/droiddeck/launcher/ui/ModeSettingsDialog.kt b/app/src/main/java/com/droiddeck/launcher/ui/ModeSettingsDialog.kt
+index 70fd435..f16d691 100644
+--- a/app/src/main/java/com/droiddeck/launcher/ui/ModeSettingsDialog.kt
++++ b/app/src/main/java/com/droiddeck/launcher/ui/ModeSettingsDialog.kt
+@@ -83,6 +83,7 @@ class ModeSettings(
+     val syncBackend: String? = null,
+     val picturePosition: String? = null,
+     val stretch16x9: Boolean? = null,
++    val refreshCap: Int? = null,
+     val steamClientArch: String? = null,
+     val returnAfterGame: Boolean? = null,
+     val shaderPrecache: Boolean? = null,
+@@ -138,6 +139,7 @@ class ModeSettingsActions(
+     val onSyncBackend: (String) -> Unit = {},
+     val onPicturePosition: (String) -> Unit = {},
+     val onStretch16x9: (Boolean) -> Unit = {},
++    val onRefreshCap: (Int) -> Unit = {},
+     val onSteamRepair: () -> Unit = {},
+     val onSteamClientArch: (String) -> Unit = {},
+     val onMangoapp: (Boolean) -> Unit = {},
+@@ -238,6 +240,12 @@ fun ModeSheetRows(s: ModeSettings, a: ModeSettingsActions, tab: String, extras:
+                     listOf(false to stringResource(R.string.display_preserve), true to stringResource(R.string.display_stretch)),
+                     s.stretch16x9 && canStretch, enabled = canStretch, onPick = a.onStretch16x9)
+             }
++            s.refreshCap?.let { cap ->
++                ChoiceRow(host, "refresh-cap", stringResource(R.string.display_refresh_cap),
++                    stringResource(R.string.display_refresh_cap_hint),
++                    listOf(0 to stringResource(R.string.display_refresh_cap_panel), 60 to stringResource(R.string.display_refresh_cap_60)),
++                    if (cap in 1..60) 60 else 0, onPick = a.onRefreshCap)
++            }
+         }
+         SettingsGroup(stringResource(R.string.display_image_scaling)) {
+             ChoiceRow(
+@@ -553,12 +561,20 @@ fun ModeSheetRows(s: ModeSettings, a: ModeSettingsActions, tab: String, extras:
+             ) {
+                 SecondaryButton(stringResource(R.string.mode_steam_repair_button), enabled = !s.steamRepairQueued, onClick = a.onSteamRepair)
+             }
+-            if (s.steamClientArch != null) ChoiceRow(
+-                host, "clientArch", stringResource(R.string.mode_client_arch),
+-                clientArchHint(stringResource(R.string.common_applies_next_session), x64FexVersion(LocalContext.current)),
+-                listOf("arm64" to stringResource(R.string.mode_client_arch_arm64), "x86_64" to stringResource(R.string.mode_client_arch_x64)), s.steamClientArch,
+-                onPick = a.onSteamClientArch,
+-            )
++            if (s.steamClientArch != null) {
++                val armv80 = SessionPrefs.steamClientArchLocked()
++                ChoiceRow(
++                    host, "clientArch", stringResource(R.string.mode_client_arch),
++                    clientArchHint(
++                        stringResource(if (armv80) R.string.mode_client_arch_armv80 else R.string.common_applies_next_session),
++                        x64FexVersion(LocalContext.current),
++                    ),
++                    if (armv80) listOf("x86_64" to stringResource(R.string.mode_client_arch_x64))
++                    else listOf("arm64" to stringResource(R.string.mode_client_arch_arm64), "x86_64" to stringResource(R.string.mode_client_arch_x64)),
++                    s.steamClientArch,
++                    onPick = a.onSteamClientArch,
++                )
++            }
+         }
+         if (s.bootMovie != null) BootMovieGroup(s, a, host)
+         if (s.integration != null) SteamIntegrationGroup(s.integration,
+diff --git a/app/src/main/res/values-b+es+419/strings.xml b/app/src/main/res/values-b+es+419/strings.xml
+index f38bdce..f445d2f 100644
+--- a/app/src/main/res/values-b+es+419/strings.xml
++++ b/app/src/main/res/values-b+es+419/strings.xml
+@@ -2232,6 +2232,10 @@
+     <string name="display_session">Pantalla de la sesión</string>
+     <string name="display_resolution">Resolución</string>
+     <string name="display_game_fit">Ajuste de juegos 16:9</string>
++    <string name="display_refresh_cap">Frecuencia de la sesión</string>
++    <string name="display_refresh_cap_hint">60 Hz reduce a la mitad el trabajo de dibujo del compositor y de la interfaz de Steam, y el calor que conlleva. Se aplica en la próxima sesión.</string>
++    <string name="display_refresh_cap_panel">Máximo del panel</string>
++    <string name="display_refresh_cap_60">60 Hz</string>
+     <string name="display_game_fit_hint">Cómo se ajustan los juegos 16:9 a esta pantalla. Próxima sesión.</string>
+     <string name="display_game_fit_unavailable">Elige Igual a la pantalla o un tamaño personalizado más estrecho que 16:9.</string>
+     <string name="display_preserve">Mantener proporciones</string>
+@@ -2721,6 +2725,7 @@
+     <string name="mode_client_arch_fex">FEX %1$s</string>
+     <string name="mode_client_arch_arm64">ARM64</string>
+     <string name="mode_client_arch_x64">x86-64</string>
++    <string name="mode_client_arch_armv80">Esta CPU es ARMv8.0 (sin atomics LSE): el cliente ARM64 de Steam de Valve no puede ejecutarse en ella, así que DroidDeck usa el cliente x86-64 mediante FEX. Se aplica en la próxima sesión.</string>
+     <string name="setup_vac_diag">Diagnóstico de VAC</string>
+     <string name="setup_vac_diag_hint">Los juegos Source registran su consola (-condebug); vac.txt en los registros de sesión dice si es seguro o no</string>
+     <string name="load_starting_steam_x64">Iniciando Steam x86-64</string>
+@@ -3436,6 +3441,7 @@
+     <string name="sync_not_running">Syncthing no se está ejecutando.</string>
+     <string name="session_end_steam_sigill">Steam se detuvo por una instrucción ilegal (SIGILL). Puede ser un problema de compatibilidad con instrucciones de la CPU o un fallo del cliente. Comparte los registros con los datos de tu dispositivo.</string>
+     <string name="session_end_steam_try_x64">Puedes probar Ajustes de Steam → Cliente de Steam → x86-64 (experimental). Requiere una descarga adicional y puede ir más lento.</string>
++    <string name="session_end_steam_sigill_armv80">Esta CPU es ARMv8.0 (sin atomics LSE) y el cliente ARM64 de Steam de Valve necesita ARMv8.1. La próxima sesión inicia en su lugar el cliente x86-64 mediante FEX (su primer inicio descarga unos 2 GB).</string>
+     <string name="session_end_vulkan_device">El controlador gráfico de Linux no encontró un dispositivo Vulkan utilizable. Comprueba que el controlador de GPU de Linux seleccionado sea compatible con esta GPU.</string>
+     <string name="session_end_gpu_unsupported">Esta sesión no puede iniciarse porque esta GPU no tiene un controlador Vulkan de Linux compatible en la configuración actual. Los controladores Turnip de Adreno no pueden habilitar la compatibilidad con GPU MediaTek/Mali.</string>
+     <string name="setup_group_memory">Memoria</string>
+diff --git a/app/src/main/res/values-es/strings.xml b/app/src/main/res/values-es/strings.xml
+index 1e7fb48..392b2d4 100644
+--- a/app/src/main/res/values-es/strings.xml
++++ b/app/src/main/res/values-es/strings.xml
+@@ -2187,6 +2187,10 @@
+     <string name="display_session">Pantalla de la sesión</string>
+     <string name="display_resolution">Resolución</string>
+     <string name="display_game_fit">Ajuste de juegos 16:9</string>
++    <string name="display_refresh_cap">Frecuencia de la sesión</string>
++    <string name="display_refresh_cap_hint">60 Hz reduce a la mitad el trabajo de dibujo del compositor y de la interfaz de Steam, y el calor que conlleva. Se aplica en la próxima sesión.</string>
++    <string name="display_refresh_cap_panel">Máximo del panel</string>
++    <string name="display_refresh_cap_60">60 Hz</string>
+     <string name="display_game_fit_hint">Cómo se ajustan los juegos 16:9 a esta pantalla. Próxima sesión.</string>
+     <string name="display_game_fit_unavailable">Elige Igual a la pantalla o un tamaño personalizado más estrecho que 16:9.</string>
+     <string name="display_preserve">Mantener proporciones</string>
+@@ -2875,6 +2879,7 @@
+     <string name="mode_client_arch_fex">FEX %1$s</string>
+     <string name="mode_client_arch_arm64">ARM64</string>
+     <string name="mode_client_arch_x64">x86-64</string>
++    <string name="mode_client_arch_armv80">Esta CPU es ARMv8.0 (sin atomics LSE): el cliente ARM64 de Steam de Valve no puede ejecutarse en ella, así que DroidDeck usa el cliente x86-64 mediante FEX. Se aplica en la próxima sesión.</string>
+     <string name="setup_vac_diag">Diagnóstico de VAC</string>
+     <string name="setup_vac_diag_hint">Los juegos Source registran su consola (-condebug); vac.txt en los registros dice si es seguro o no</string>
+     <string name="load_starting_steam_x64">Iniciando Steam x86-64</string>
+@@ -3463,6 +3468,7 @@
+     <string name="sync_not_running">Syncthing no se está ejecutando.</string>
+     <string name="session_end_steam_sigill">Steam se detuvo por una instrucción ilegal (SIGILL). Puede ser un problema de compatibilidad con instrucciones de la CPU o un fallo del cliente. Comparte los registros con los datos de tu dispositivo.</string>
+     <string name="session_end_steam_try_x64">Puedes probar Ajustes de Steam → Cliente de Steam → x86-64 (experimental). Requiere una descarga adicional y puede ir más lento.</string>
++    <string name="session_end_steam_sigill_armv80">Esta CPU es ARMv8.0 (sin atomics LSE) y el cliente ARM64 de Steam de Valve necesita ARMv8.1. La próxima sesión inicia en su lugar el cliente x86-64 mediante FEX (su primer inicio descarga unos 2 GB).</string>
+     <string name="session_end_vulkan_device">El controlador gráfico de Linux no ha encontrado un dispositivo Vulkan utilizable. Comprueba que el controlador de GPU de Linux seleccionado sea compatible con esta GPU.</string>
+     <string name="session_end_gpu_unsupported">Esta sesión no puede iniciarse porque esta GPU no tiene un controlador Vulkan de Linux compatible en la configuración actual. Los controladores Turnip de Adreno no pueden habilitar la compatibilidad con GPU MediaTek/Mali.</string>
+     <string name="setup_group_memory">Memoria</string>
+diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
+index 6a7a221..93d94ac 100644
+--- a/app/src/main/res/values/strings.xml
++++ b/app/src/main/res/values/strings.xml
+@@ -2388,6 +2388,10 @@
+     <string name="display_session">Session display</string>
+     <string name="display_resolution">Resolution</string>
+     <string name="display_game_fit">16:9 game fit</string>
++    <string name="display_refresh_cap">Session refresh rate</string>
++    <string name="display_refresh_cap_hint">60 Hz halves the drawing work of the compositor and the Steam interface, and the heat that comes with it. Applies next session.</string>
++    <string name="display_refresh_cap_panel">Panel maximum</string>
++    <string name="display_refresh_cap_60">60 Hz</string>
+     <string name="display_game_fit_hint">How 16:9 games fit this display. Next session.</string>
+     <string name="display_game_fit_unavailable">Choose Match screen or a custom size that isn\'t 16:9.</string>
+     <string name="display_preserve">Keep proportions</string>
+@@ -2933,6 +2937,7 @@
+     <string name="mode_client_arch_fex">FEX %1$s</string>
+     <string name="mode_client_arch_arm64">ARM64</string>
+     <string name="mode_client_arch_x64">x86-64</string>
++    <string name="mode_client_arch_armv80">This CPU is ARMv8.0 (no LSE atomics): Valve\'s ARM64 Steam client cannot run on it, so DroidDeck uses the x86-64 client through FEX. Applies next session.</string>
+     <string name="setup_vac_diag">VAC diagnostics</string>
+     <string name="setup_vac_diag_hint">Source games log their console (-condebug); vac.txt in the session logs says secure or insecure</string>
+     <string name="load_starting_steam_x64">Starting Steam x86-64</string>
+@@ -3646,6 +3651,7 @@
+     <string name="setup_bridge_safe_off_detail">Faster where this GPU passed its checks.</string>
+     <string name="session_end_steam_sigill">Steam stopped with an illegal instruction (SIGILL). This can be a CPU instruction compatibility problem or a client crash. Share the logs with your device details.</string>
+     <string name="session_end_steam_try_x64">You can try Steam settings → Steam client → x86-64 (experimental). It needs an additional download and may run more slowly.</string>
++    <string name="session_end_steam_sigill_armv80">This CPU is ARMv8.0 (no LSE atomics) and Valve\'s ARM64 Steam client needs ARMv8.1. The next session starts the x86-64 client through FEX instead (its first start downloads about 2 GB).</string>
+     <string name="session_end_vulkan_device">The Linux graphics driver could not find a usable Vulkan device. Check that the selected Linux GPU driver supports this GPU.</string>
+     <string name="session_end_gpu_unsupported">This session cannot start because this GPU has no compatible Linux Vulkan driver in the current setup. Adreno Turnip drivers cannot enable support for MediaTek/Mali GPUs.</string>
+     <string name="setup_group_memory">Memory</string>
+diff --git a/app/src/test/java/com/droiddeck/launcher/core/CpuFeaturesTest.kt b/app/src/test/java/com/droiddeck/launcher/core/CpuFeaturesTest.kt
+new file mode 100644
+index 0000000..e178bb7
+--- /dev/null
++++ b/app/src/test/java/com/droiddeck/launcher/core/CpuFeaturesTest.kt
+@@ -0,0 +1,69 @@
++package com.droiddeck.launcher.core
++
++import com.droiddeck.launcher.gpu.GpuInfo
++import java.nio.ByteBuffer
++import java.nio.ByteOrder
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertFalse
++import org.junit.Assert.assertTrue
++import org.junit.Test
++
++class CpuFeaturesTest {
++    private fun auxv(vararg pairs: Pair<Long, Long>): ByteArray {
++        val buffer = ByteBuffer.allocate((pairs.size + 1) * 16).order(ByteOrder.LITTLE_ENDIAN)
++        pairs.forEach { (type, value) -> buffer.putLong(type).putLong(value) }
++        buffer.putLong(0L).putLong(0L)
++        return buffer.array()
++    }
++
++    // The Redmi Note 13 (Snapdragon 685: Cortex-A73 + A53) report, as the kernel lists it.
++    private val snapdragon685 = """
++        processor : 0
++        Features : fp asimd evtstrm aes pmull sha1 sha2 crc32 cpuid
++        processor : 4
++        Features : fp asimd evtstrm aes pmull sha1 sha2 crc32 cpuid
++    """.trimIndent()
++
++    @Test fun hwcapWithoutAtomicsIsArmv80() {
++        // HWCAP_FP | HWCAP_ASIMD | HWCAP_AES | HWCAP_PMULL | HWCAP_SHA1 | HWCAP_SHA2 | HWCAP_CRC32 | HWCAP_CPUID
++        val hwcap = 0b1L or 0b10L or (1L shl 3) or (1L shl 4) or (1L shl 5) or (1L shl 6) or (1L shl 7) or (1L shl 11)
++        assertEquals(CpuFeatures.Lse.ABSENT, CpuFeatures.lseFromAuxv(auxv(6L to 4096L, 16L to hwcap)))
++    }
++
++    @Test fun hwcapWithAtomicsIsLse() {
++        assertEquals(CpuFeatures.Lse.PRESENT, CpuFeatures.lseFromAuxv(auxv(16L to (1L shl 8 or 0b11L))))
++    }
++
++    @Test fun auxvWithoutHwcapOrTooShortSaysNothing() {
++        assertEquals(CpuFeatures.Lse.UNKNOWN, CpuFeatures.lseFromAuxv(auxv(6L to 4096L)))
++        assertEquals(CpuFeatures.Lse.UNKNOWN, CpuFeatures.lseFromAuxv(ByteArray(8)))
++        assertEquals(CpuFeatures.Lse.UNKNOWN, CpuFeatures.lseFromAuxv(null))
++    }
++
++    @Test fun cpuInfoOfTheSnapdragon685LacksAtomics() {
++        assertEquals(CpuFeatures.Lse.ABSENT, CpuFeatures.lseFromCpuInfo(snapdragon685))
++    }
++
++    @Test fun everyCoreMustListTheExactToken() {
++        assertEquals(CpuFeatures.Lse.PRESENT, CpuFeatures.lseFromCpuInfo("Features : fp asimd atomics\nFeatures : fp atomics lrcpc"))
++        assertEquals(CpuFeatures.Lse.ABSENT, CpuFeatures.lseFromCpuInfo("Features : fp atomics\nFeatures : fp asimd"))
++        assertEquals(CpuFeatures.Lse.ABSENT, CpuFeatures.lseFromCpuInfo("Features : fp noatomics atomics_extra"))
++        assertEquals(CpuFeatures.Lse.UNKNOWN, CpuFeatures.lseFromCpuInfo("processor : 0\n"))
++        assertEquals(CpuFeatures.Lse.UNKNOWN, CpuFeatures.lseFromCpuInfo(null))
++    }
++
++    @Test fun auxvWinsOverCpuInfoAndCpuInfoFillsIn() {
++        assertEquals(CpuFeatures.Lse.ABSENT, CpuFeatures.combine(CpuFeatures.Lse.ABSENT, CpuFeatures.Lse.PRESENT))
++        assertEquals(CpuFeatures.Lse.ABSENT, CpuFeatures.combine(CpuFeatures.Lse.UNKNOWN, CpuFeatures.Lse.ABSENT))
++        assertEquals(CpuFeatures.Lse.UNKNOWN, CpuFeatures.combine(CpuFeatures.Lse.UNKNOWN, CpuFeatures.Lse.UNKNOWN))
++    }
++
++    @Test fun lowTierCoversArmv80CpusAndSmallAdreno6xx() {
++        assertTrue(LowTierDevice.isLowTier(GpuInfo.Family.A6XX, 610, armv80Only = false))
++        assertTrue(LowTierDevice.isLowTier(GpuInfo.Family.A6XX, 619, armv80Only = false))
++        assertTrue(LowTierDevice.isLowTier(GpuInfo.Family.A7XX, 740, armv80Only = true))
++        assertFalse(LowTierDevice.isLowTier(GpuInfo.Family.A6XX, 650, armv80Only = false))
++        assertFalse(LowTierDevice.isLowTier(GpuInfo.Family.A7XX, 730, armv80Only = false))
++        assertFalse(LowTierDevice.isLowTier(GpuInfo.Family.MALI_OTHER, 0, armv80Only = false))
++    }
++}
+diff --git a/app/src/test/java/com/droiddeck/launcher/session/LowTierSessionPrefsTest.kt b/app/src/test/java/com/droiddeck/launcher/session/LowTierSessionPrefsTest.kt
+new file mode 100644
+index 0000000..2a2ace5
+--- /dev/null
++++ b/app/src/test/java/com/droiddeck/launcher/session/LowTierSessionPrefsTest.kt
+@@ -0,0 +1,49 @@
++package com.droiddeck.launcher.session
++
++import com.droiddeck.launcher.stores.xbox.XboxCloudSettings
++import org.junit.Assert.assertEquals
++import org.junit.Test
++
++@org.junit.runner.RunWith(org.robolectric.RobolectricTestRunner::class)
++@org.robolectric.annotation.Config(sdk = [33], application = android.app.Application::class)
++class LowTierSessionPrefsTest {
++    @Test fun armv80CpusAlwaysGetTheX64Client() {
++        assertEquals("x86_64", SessionPrefs.effectiveSteamClientArch("arm64", armv80Only = true))
++        assertEquals("x86_64", SessionPrefs.effectiveSteamClientArch("x86_64", armv80Only = true))
++        assertEquals("x86_64", SessionPrefs.effectiveSteamClientArch("something-else", armv80Only = true))
++    }
++
++    @Test fun lseCpusKeepTheirChoice() {
++        assertEquals("arm64", SessionPrefs.effectiveSteamClientArch("arm64", armv80Only = false))
++        assertEquals("x86_64", SessionPrefs.effectiveSteamClientArch("x86_64", armv80Only = false))
++    }
++
++    @Test fun lowTierStartsAt60HzOthersAtThePanelMaximum() {
++        assertEquals(60, SessionPrefs.defaultRefreshCap(lowTier = true))
++        assertEquals(0, SessionPrefs.defaultRefreshCap(lowTier = false))
++    }
++
++    @Test fun theLowestSetLimitWins() {
++        assertEquals(0, SessionPrefs.refreshLimit(0, 0))
++        assertEquals(60, SessionPrefs.refreshLimit(0, 60))
++        assertEquals(45, SessionPrefs.refreshLimit(45, 60))
++        assertEquals(60, SessionPrefs.refreshLimit(90, 60))
++        assertEquals(72, SessionPrefs.refreshLimit(72, 0))
++    }
++
++    @Test fun lowTierXcloudStartsWithoutFrameGenerationButKeepsASavedChoice() {
++        val defaults = XboxCloudSettings()
++        assertEquals("off", XboxCloudSettings.withDeviceDefaults(defaults, null, lowTier = true).frameGen)
++        assertEquals("ddfg", XboxCloudSettings.withDeviceDefaults(defaults, null, lowTier = false).frameGen)
++        val savedWithout = """{"resolution":"720p"}"""
++        assertEquals("off", XboxCloudSettings.withDeviceDefaults(XboxCloudSettings.decode(savedWithout), savedWithout, lowTier = true).frameGen)
++        val savedDdfg = """{"frameGen":"ddfg"}"""
++        assertEquals("ddfg", XboxCloudSettings.withDeviceDefaults(XboxCloudSettings.decode(savedDdfg), savedDdfg, lowTier = true).frameGen)
++        val savedLsfg = """{"frameGen":"lsfg"}"""
++        assertEquals("lsfg", XboxCloudSettings.withDeviceDefaults(XboxCloudSettings.decode(savedLsfg), savedLsfg, lowTier = false).frameGen)
++    }
++
++    @Test fun refreshCapIsResetWithTheOtherSessionSettings() {
++        assertEquals(true, SettingsReset.isSessionSetting("refreshCap"))
++    }
++}
+-- 
+2.43.0
+

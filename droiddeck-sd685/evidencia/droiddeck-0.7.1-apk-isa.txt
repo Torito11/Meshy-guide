@@ -1,0 +1,166 @@
+== lib/arm64-v8a/libgsl_alloc_hook.so
+   ARMv8.0-clean (no v8.1+ instructions found)
+== lib/arm64-v8a/libtermux.so
+   ARMv8.0-clean (no v8.1+ instructions found)
+== lib/arm64-v8a/libepoxy.so
+   ARMv8.0-clean (no v8.1+ instructions found)
+== lib/arm64-v8a/libc++_shared.so
+   LSE atomics (v8.1): 0 unguarded, 7 in runtime-checked helpers
+== lib/arm64-v8a/libffi.so
+   ARMv8.0-clean (no v8.1+ instructions found)
+== lib/arm64-v8a/libvkbridge_jni.so
+   LSE atomics (v8.1): 0 unguarded, 13 in runtime-checked helpers
+== lib/arm64-v8a/libdeviceinfo.so
+   ARMv8.0-clean (no v8.1+ instructions found)
+== lib/arm64-v8a/libltdl.so
+   ARMv8.0-clean (no v8.1+ instructions found)
+== lib/arm64-v8a/libvirgl_render_server.so
+   LSE atomics (v8.1): 0 unguarded, 2 in runtime-checked helpers
+== lib/arm64-v8a/libpulseaudio.so
+   ARMv8.0-clean (no v8.1+ instructions found)
+== lib/arm64-v8a/libpulse.so
+   LSE atomics (v8.1): 0 unguarded, 1 in runtime-checked helpers
+== lib/arm64-v8a/libopenxr_loader.so
+   ARMv8.0-clean (no v8.1+ instructions found)
+== lib/arm64-v8a/libspake2.so
+   ARMv8.0-clean (no v8.1+ instructions found)
+== lib/arm64-v8a/libdirectaudiorelay.so
+   LSE atomics (v8.1): 0 unguarded, 6 in runtime-checked helpers
+== lib/arm64-v8a/libsurface_util_jni.so
+   ARMv8.0-clean (no v8.1+ instructions found)
+== lib/arm64-v8a/libsdnative.so
+   ARMv8.0-clean (no v8.1+ instructions found)
+== lib/arm64-v8a/libpulsecommon-13.0.so
+   LSE atomics (v8.1): 0 unguarded, 3 in runtime-checked helpers
+== lib/arm64-v8a/libzstd-jni-1.5.7-4.so
+   ARMv8.0-clean (no v8.1+ instructions found)
+== lib/arm64-v8a/libwayland-server.so
+   ARMv8.0-clean (no v8.1+ instructions found)
+== lib/arm64-v8a/libdroiddeckstores.so
+   RCPC2 ldapur/stlur (v8.4): 2 unguarded
+      e.g. 0x38a1f8 ldapurh w0, [x25, #-0xdc] in <Java_com_droiddeck_launcher_stores_gog_GogNative_nativeStart>
+== lib/arm64-v8a/libvirgl_test_server.so
+   ARMv8.0-clean (no v8.1+ instructions found)
+== lib/arm64-v8a/libdroiddeckwayland.so
+   LSE atomics (v8.1): 0 unguarded, 4 in runtime-checked helpers
+== lib/arm64-v8a/libhook_impl.so
+   ARMv8.0-clean (no v8.1+ instructions found)
+== lib/arm64-v8a/libddvenc.so
+   LSE atomics (v8.1): 0 unguarded, 1 in runtime-checked helpers
+== lib/arm64-v8a/libimage_processing_util_jni.so
+   ARMv8.0-clean (no v8.1+ instructions found)
+== lib/arm64-v8a/libmain_hook.so
+   ARMv8.0-clean (no v8.1+ instructions found)
+== lib/arm64-v8a/libfile_redirect_hook.so
+   ARMv8.0-clean (no v8.1+ instructions found)
+== lib/arm64-v8a/libpulsecore-13.0.so
+   LSE atomics (v8.1): 0 unguarded, 3 in runtime-checked helpers
+== lib/arm64-v8a/libdroiddeckxr.so
+   LSE atomics (v8.1): 0 unguarded, 1 in runtime-checked helpers
+== lib/arm64-v8a/libvirglrenderer.so
+   LSE atomics (v8.1): 0 unguarded, 3 in runtime-checked helpers
+== lib/arm64-v8a/libjingle_peerconnection_so.so
+   LSE atomics (v8.1): 0 unguarded, 10 in runtime-checked helpers
+   RCPC2 ldapur/stlur (v8.4): 2 unguarded
+      e.g. 0x292ea4 ldapurh w0, [x25, #-0xdc] in <JNI_OnLoad>
+   DotProd (v8.2/8.4): 2098 unguarded
+      e.g. 0x2d725c udot v1.4s, v16.16b, v0.16b in <JNI_OnLoad>
+   I8MM/BF16 (v8.6): 502 unguarded
+      e.g. 0x2dcd74 usdot v5.4s, v7.16b, v2.16b in <JNI_OnLoad>
+== lib/arm64-v8a/libvkbridge_server.so
+   LSE atomics (v8.1): 0 unguarded, 13 in runtime-checked helpers
+== lib/arm64-v8a/libgpuclock.so
+   LSE atomics (v8.1): 0 unguarded, 1 in runtime-checked helpers
+== lib/arm64-v8a/libsyncthingnative.so
+   LSE atomics (v8.1): 2651 unguarded
+      e.g. 0x11286e4 casal w27, w2, [x0] in <.text>
+== lib/arm64-v8a/libsndfile.so
+   ARMv8.0-clean (no v8.1+ instructions found)
+== assets/linuxfs/libblsession.so
+   LSE atomics (v8.1): 0 unguarded, 23 in runtime-checked helpers
+== assets/linuxfs/libssbs.so
+   LSE atomics (v8.1): 0 unguarded, 1 in runtime-checked helpers
+== assets/linuxfs/libfakeinput.so
+   LSE atomics (v8.1): 0 unguarded, 12 in runtime-checked helpers
+   SVE/SVE2: 6 unguarded
+      e.g. 0xff55c cntd x0 in <_ZNSt8__detail9_Map_baseIiSt4pairIKi9ff_effectESaIS4_ENS_10_Select1stESt8equal_toIiESt4hashIiENS_18_Mod_range_hashingENS_20_Default_ranged_hashENS_20_Prime_rehash_policyENS_17_Hashtable_traitsILb0ELb0ELb1EEELb1EEixEOi>
+== assets/linuxfs/libblaudit.so
+   ARMv8.0-clean (no v8.1+ instructions found)
+== assets/linuxfs/usr/lib/libVkLayer_FROG_gamescope_wsi_aarch64.so
+   LSE atomics (v8.1): 0 unguarded, 1 in runtime-checked helpers
+== assets/linuxfs/usr/local/lib/droiddeck/uruntime
+   LSE atomics (v8.1): 0 unguarded, 14 in runtime-checked helpers
+== assets/linuxfs/usr/local/lib/droiddeck-inno/libboost_program_options.so.1.92.0
+   LSE atomics (v8.1): 0 unguarded, 2 in runtime-checked helpers
+== assets/linuxfs/usr/local/lib/droiddeck-inno/innoextract
+   LSE atomics (v8.1): 0 unguarded, 2 in runtime-checked helpers
+== assets/linuxfs/usr/local/lib/droiddeck-inno/libboost_iostreams.so.1.92.0
+   LSE atomics (v8.1): 0 unguarded, 2 in runtime-checked helpers
+== assets/linuxfs/usr/local/lib/droiddeck-inno/libboost_filesystem.so.1.92.0
+   LSE atomics (v8.1): 0 unguarded, 3 in runtime-checked helpers
+== assets/linuxfs/usr/local/lib/droiddeck-inno/libboost_container.so.1.92.0
+   LSE atomics (v8.1): 0 unguarded, 2 in runtime-checked helpers
+== assets/linuxfs/usr/local/lib/droiddeck-inno/libboost_random.so.1.92.0
+   ARMv8.0-clean (no v8.1+ instructions found)
+== assets/linuxfs/usr/local/lib/vkbridge/libvulkan_droidbridge.so
+   LSE atomics (v8.1): 0 unguarded, 8 in runtime-checked helpers
+== assets/linuxfs/usr/local/lib/droiddeck-xclipse/libVkLayer_droiddeck_xclipse.so
+   ARMv8.0-clean (no v8.1+ instructions found)
+== assets/linuxfs/usr/local/lib/droiddeck-vr/droiddeck/bin/linuxarm64/driver_droiddeck.so
+   LSE atomics (v8.1): 0 unguarded, 7 in runtime-checked helpers
+   SVE/SVE2: 6 unguarded
+      e.g. 0x1821fc cntd x0 in <_ZNSt13basic_istreamIwSt11char_traitsIwEE6ignoreEl>
+== assets/linuxfs/usr/local/lib/droiddeck-vr/droiddeck/bin/linuxarm64/xr-display-mode
+   LSE atomics (v8.1): 0 unguarded, 3 in runtime-checked helpers
+   SVE/SVE2: 6 unguarded
+      e.g. 0x2bacc cntd x0 in <execute_stack_op>
+== assets/linuxfs/usr/local/lib/droiddeck-vr/layer/libdroiddeck_vr_scheduling.so
+   ARMv8.0-clean (no v8.1+ instructions found)
+== assets/linuxfs/usr/local/lib/droiddeck-vr/layer/libVkLayer_droiddeck_vr.so
+   LSE atomics (v8.1): 0 unguarded, 5 in runtime-checked helpers
+   SVE/SVE2: 6 unguarded
+      e.g. 0x56e9c cntd x0 in <_ZNSt12__sso_stringaSEOS_>
+== assets/linuxfs/usr/local/lib/droiddeck-msitools/libgsf-1.so.114
+   ARMv8.0-clean (no v8.1+ instructions found)
+== assets/linuxfs/usr/local/lib/droiddeck-msitools/msiinfo
+   ARMv8.0-clean (no v8.1+ instructions found)
+== assets/linuxfs/usr/local/lib/droiddeck-msitools/cabextract
+   ARMv8.0-clean (no v8.1+ instructions found)
+== assets/linuxfs/usr/local/lib/droiddeck-msitools/7z
+   LSE atomics (v8.1): 0 unguarded, 1 in runtime-checked helpers
+== assets/linuxfs/usr/local/lib/droiddeck-msitools/libgcab-1.0.so.0
+   ARMv8.0-clean (no v8.1+ instructions found)
+== assets/linuxfs/usr/local/lib/droiddeck-msitools/7z.so
+   LSE atomics (v8.1): 0 unguarded, 1 in runtime-checked helpers
+== assets/linuxfs/usr/local/lib/droiddeck-msitools/libmsi-1.0.so.0
+   LSE atomics (v8.1): 0 unguarded, 1 in runtime-checked helpers
+== assets/linuxfs/usr/local/lib/droiddeck-mali/libVkLayer_droiddeck_mali_compat.so
+   LSE atomics (v8.1): 0 unguarded, 2 in runtime-checked helpers
+== assets/linuxfs/usr/local/lib/droiddeck-gpuload/libVkLayer_droiddeck_gpuload.so
+   LSE atomics (v8.1): 0 unguarded, 4 in runtime-checked helpers
+== assets/linuxfs/usr/local/lib/droiddeck-gpuload/libVkLayer_droiddeck_vramcap.so
+   LSE atomics (v8.1): 0 unguarded, 1 in runtime-checked helpers
+== assets/linuxfs/usr/local/lib/mangoapp/libtracefs.so.1
+   ARMv8.0-clean (no v8.1+ instructions found)
+== assets/linuxfs/usr/local/lib/mangoapp/libtraceevent.so.1
+   ARMv8.0-clean (no v8.1+ instructions found)
+== assets/linuxfs/usr/local/lib/mangoapp/libfmt.so.10
+   ARMv8.0-clean (no v8.1+ instructions found)
+== assets/linuxfs/usr/local/lib/mangoapp/libspdlog.so.1.13
+   LSE atomics (v8.1): 0 unguarded, 4 in runtime-checked helpers
+== assets/linuxfs/usr/local/lib/mangoapp/mangoapp
+   LSE atomics (v8.1): 0 unguarded, 5 in runtime-checked helpers
+== assets/linuxfs/usr/local/lib/mangoapp/libglfw.so.3
+   ARMv8.0-clean (no v8.1+ instructions found)
+== assets/linuxfs/usr/local/bin/gamescope
+   LSE atomics (v8.1): 0 unguarded, 13 in runtime-checked helpers
+== assets/linuxfs/usr/local/bin/droiddeck-clipboard
+   ARMv8.0-clean (no v8.1+ instructions found)
+== assets/linuxfs/usr/local/bin/droiddeck-vkbridge-smoke
+   ARMv8.0-clean (no v8.1+ instructions found)
+== assets/linuxfs/usr/local/bin/droiddeck-glprobe
+   ARMv8.0-clean (no v8.1+ instructions found)
+== assets/linuxfs/libblfastpath.so
+   LSE atomics (v8.1): 0 unguarded, 2 in runtime-checked helpers
+== assets/venus/libvulkan_virtio.so
+   LSE atomics (v8.1): 0 unguarded, 8 in runtime-checked helpers

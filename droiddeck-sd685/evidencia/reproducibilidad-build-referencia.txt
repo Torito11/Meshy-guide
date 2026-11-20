@@ -1,0 +1,7 @@
+entries: 596 vs 596; identical: 576; different: 20; only first: 0; only second: 0
+  differs [META-INF] (1): version-control-info.textproto
+  differs [assets] (1): baseline.prof
+  differs [classes2.dex] (1): classes2.dex
+  differs [classes3.dex] (1): classes3.dex
+  differs [classes5.dex] (1): classes5.dex
+  differs [lib] (15): libc++_shared.so, libddvenc.so, libdeviceinfo.so, libdroiddeckstores.so, libdroiddeckwayland.so, libdroiddeckxr.so, libfile_redirect_hook.so, libgpuclock.so, libgsl_alloc_hook.so, libhook_impl.so, libmain_hook.so, libsdnative.so ...

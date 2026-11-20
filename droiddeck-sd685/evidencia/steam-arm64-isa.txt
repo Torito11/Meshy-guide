@@ -1,0 +1,60 @@
+# Cliente Steam ARM64 de Valve (manifiesto steam_client_steamdeck_publicbeta_linuxarm64, version 1793740892)
+# Paquetes: steam_linuxarm64 + bins_linuxarm64_linuxarm64 descargados de client-update.fastly.steamstatic.com
+== a/steamrtarm64/steam
+   LSE atomics (v8.1): 344 unguarded, 4 in runtime-checked helpers
+      e.g. 0x8f014 ldaddal w2, w2, [x3] in <.text>
+   RCPC2 ldapur/stlur (v8.4): 3 unguarded
+      e.g. 0x4e3634 ldapurh w0, [x25, #-0xdc] in <gcm_ghash_v8>
+   FCMA (v8.3): 5 unguarded
+      e.g. 0x578c38 fcmla v16.8h, v3.8h, v18.h[1], #270 in <sha1_block_data_order>
+   SVE/SVE2: 9 unguarded
+      e.g. 0x57bba0 ld1d { z3.d }, p6/z, [x19, z9.d, sxtw] in <sha512_block_data_order>
+== a/steamrtarm64/steamclient.so
+   LSE atomics (v8.1): 5888 unguarded, 4 in runtime-checked helpers
+      e.g. 0x401014 ldaddal w2, w2, [x3] in <.text>
+   RCPC2 ldapur/stlur (v8.4): 3 unguarded
+      e.g. 0x1ef7d54 ldapurh w0, [x25, #-0xdc] in <gcm_ghash_v8>
+   FCMA (v8.3): 5 unguarded
+      e.g. 0x1f8c438 fcmla v16.8h, v3.8h, v18.h[1], #270 in <sha1_block_data_order>
+   SVE/SVE2: 9 unguarded
+      e.g. 0x1f8f3a0 ld1d { z3.d }, p6/z, [x19, z9.d, sxtw] in <sha512_block_data_order>
+== a/steamrtarm64/libtier0_s.so
+   LSE atomics (v8.1): 23 unguarded
+      e.g. 0x1fc24 ldaddal w1, w1, [x0] in <ThreadInterlockedIncrement>
+   SVE/SVE2: 8 unguarded
+      e.g. 0x3a3f4 cntd x0 in <__wrap_chdir>
+== a/steamrtarm64/steamui.so
+   LSE atomics (v8.1): 4470 unguarded, 4 in runtime-checked helpers
+      e.g. 0x476014 ldaddal w2, w2, [x3] in <.text>
+   RCPC2 ldapur/stlur (v8.4): 3 unguarded
+      e.g. 0x168dad4 ldapurh w0, [x25, #-0xdc] in <gcm_ghash_v8>
+   FCMA (v8.3): 5 unguarded
+      e.g. 0x1723038 fcmla v16.8h, v3.8h, v18.h[1], #270 in <sha1_block_data_order>
+   SVE/SVE2: 9 unguarded
+      e.g. 0x1725fa0 ld1d { z3.d }, p6/z, [x19, z9.d, sxtw] in <sha512_block_data_order>
+== a/steamrtarm64/steamwebhelper
+   LSE atomics (v8.1): 1711 unguarded, 4 in runtime-checked helpers
+      e.g. 0xcf014 ldaddal w2, w2, [x3] in <.text>
+   RCPC2 ldapur/stlur (v8.4): 3 unguarded
+      e.g. 0x445154 ldapurh w0, [x25, #-0xdc] in <gcm_ghash_v8>
+   FCMA (v8.3): 5 unguarded
+      e.g. 0x48e74c fcmla v16.8h, v3.8h, v18.h[1], #270 in <bn_mul_mont>
+   SVE/SVE2: 9 unguarded
+      e.g. 0x4d1d20 ld1d { z3.d }, p6/z, [x19, z9.d, sxtw] in <sha512_block_data_order>
+
+## Desensamblado de libtier0_s.so (sin comprobacion de HWCAP antes del atomic LSE):
+Disassembly of section .text:
+
+000000000001fc20 <ThreadInterlockedIncrement>:
+   1fc20:      	mov	w1, #0x1                // =1
+   1fc24:      	ldaddal	w1, w1, [x0]
+   1fc28:      	add	w0, w1, #0x1
+   1fc2c:      	sxtw	x0, w0
+   1fc30:      	ret
+   1fc34:      	nop
+
+000000000001fc70 <ThreadInterlockedCompareExchange>:
+   1fc70:      	casal	w2, w1, [x0]
+   1fc74:      	sxtw	x0, w2
+   1fc78:      	ret
+   1fc7c:      	nop

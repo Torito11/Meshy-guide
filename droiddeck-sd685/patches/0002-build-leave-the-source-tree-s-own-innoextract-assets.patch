@@ -1,0 +1,27 @@
+From e18f712ddeeed4b1362b093ae9e322ba5e7cf199 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 20 Nov 2026 20:23:05 +0000
+Subject: [PATCH 2/8] build: leave the source tree's own innoextract assets to
+ Gradle when staging a release
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ tools/sd685/stage_release_inputs.sh | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/tools/sd685/stage_release_inputs.sh b/tools/sd685/stage_release_inputs.sh
+index dc736bb..8739879 100755
+--- a/tools/sd685/stage_release_inputs.sh
++++ b/tools/sd685/stage_release_inputs.sh
+@@ -23,6 +23,8 @@ jni=$repo_root/app/src/main/jniLibs/arm64-v8a
+ rm -rf "$assets/linuxfs" "$assets/droiddeck-esync"
+ mkdir -p "$assets" "$prepared/graphics_driver" "$jni"
+ cp -a "$work/assets/linuxfs" "$assets/linuxfs"
++# Gradle stages these from the source tree itself.
++(cd "$repo_root/tools/linuxfs/innoextract" && find linuxfs -type f) | while read -r own; do rm -f "$assets/$own"; done
+ cp -a "$work/assets/droiddeck-esync" "$assets/droiddeck-esync"
+ cp -f "$work/assets/pulseaudio.tzst" "$prepared/pulseaudio.tzst"
+ for name in turnip25.1.0-quest1 turnip26.3.0-a6xx turnip26.3.0-quest2; do
+-- 
+2.43.0
+

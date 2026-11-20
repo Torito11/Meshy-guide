@@ -1,0 +1,364 @@
+From fcd85f1e1b965a7da22a559ca9d0f3d0c7cfab38 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 20 Nov 2026 20:41:50 +0000
+Subject: [PATCH 4/8] fix(steam): ARMv8.0 CPUs run Windows games through
+ Valve's x86-64 Proton under FEX
+
+Valve's arm64 Steam client (libtier0_s.so ThreadInterlockedIncrement is a bare
+ldaddal) and every arm64 Proton build (Proton's Makefile: -march=armv8.2-a; GE-Proton
+aarch64's wineserver, ntdll and DXVK carry unguarded LSE atomics) stop with SIGILL on
+cores without LSE atomics, such as the Cortex-A73/A53 of the Snapdragon 685.
+
+On such a CPU the x86-64 client no longer bridges the arm64 Protons, makes
+proton_experimental its default, moves only titles mapped to an arm64 tool, keeps a
+title's own x86-64 Proton choice, and the session skips the GE-Proton aarch64
+download and the arm64 client update it cannot use. CPUs with LSE, and CPUs whose
+features cannot be read, keep the previous behaviour.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../overlay/usr/local/bin/droiddeck-session   |  20 +-
+ .../overlay/usr/local/bin/droiddeck-steam-x64 |  26 ++-
+ .../overlay/usr/local/bin/steam-compatibility |  10 +
+ tools/tests/test_armv80_steam.py              | 182 ++++++++++++++++++
+ 4 files changed, 228 insertions(+), 10 deletions(-)
+ create mode 100644 tools/tests/test_armv80_steam.py
+
+diff --git a/tools/linuxfs/overlay/usr/local/bin/droiddeck-session b/tools/linuxfs/overlay/usr/local/bin/droiddeck-session
+index df301aa..a784b4b 100755
+--- a/tools/linuxfs/overlay/usr/local/bin/droiddeck-session
++++ b/tools/linuxfs/overlay/usr/local/bin/droiddeck-session
+@@ -14,6 +14,11 @@ export HOME=${HOME:-/root}
+ mode=${1:-desktop}
+ shift || true
+ step() { echo "== STEP $(date -u +%H:%M:%S.%3N) $*"; }
++# True when a reported core lacks the ARMv8.1 `atomics` flag; absent or unreadable data says no.
++bl_cpu_armv80() {
++  awk -F: '$1 ~ /^[[:space:]]*Features[[:space:]]*$/ { seen = 1; if ($2 !~ /(^|[[:space:]])atomics([[:space:]]|$)/) missing = 1 }
++    END { exit (seen && missing) ? 0 : 1 }' /proc/cpuinfo 2>/dev/null
++}
+ steam_setup_failed() {
+   echo "== steam: the Steam client could not be set up (status $1)"
+   [ -z "${BL_STEAM_EXIT_FILE:-}" ] || printf '%s\n' "$1" > "$BL_STEAM_EXIT_FILE"
+@@ -675,13 +680,23 @@ case $mode in
+     export MOZ_SHM_NO_SEALS=1
+     steam_x64=0
+     [ "${BL_STEAM_CLIENT_ARCH:-}" = x86_64 ] && steam_x64=1
++    _bl_armv80=0
++    if bl_cpu_armv80; then
++      _bl_armv80=1
++      echo "== cpu: ARMv8.0 without LSE atomics; Valve's arm64 Steam client and arm64 Proton builds stop with SIGILL here, the x86-64 ones under FEX do not"
++      [ "$steam_x64" = 1 ] || echo "== cpu: warning: the arm64 client was asked for on this CPU"
++    fi
+     steam_cef_gpu=1
+     if [ "$steam_x64" = 1 ]; then
+       step "checking the Steam client's arm64 parts (first run downloads them, ~1-2 min)"
+       _bl_x64_repair=0
+       [ -e "$HOME/.bl-steam-repair" ] && _bl_x64_repair=1
+       droiddeck-steam-install || steam_setup_failed $?
+-      droiddeck-steam-install --sync steamdeck_publicbeta || step "could not update the arm64 client's parts; the x86-64 client keeps its own web helper"
++      if [ "$_bl_armv80" = 1 ]; then
++        step "not updating the arm64 client's parts: this CPU cannot run them"
++      else
++        droiddeck-steam-install --sync steamdeck_publicbeta || step "could not update the arm64 client's parts; the x86-64 client keeps its own web helper"
++      fi
+       step "checking the x86-64 Steam client (FEX, experimental; the first run downloads ~2 GB)"
+       BL_X64_REPAIR=$_bl_x64_repair droiddeck-steam-x64 --prepare || steam_setup_failed $?
+       step "x86-64 Steam client ready"
+@@ -710,7 +725,8 @@ case $mode in
+     _bl_proton_root=$steam_root
+     if [ "$steam_x64" = 1 ]; then
+       _bl_proton_root=$XDG_DATA_HOME/Steam
+-      if ! ls -d "$_bl_proton_root"/compatibilitytools.d/GE-Proton*-aarch64 >/dev/null 2>&1 &&
++      if [ "$_bl_armv80" = 0 ] &&
++         ! ls -d "$_bl_proton_root"/compatibilitytools.d/GE-Proton*-aarch64 >/dev/null 2>&1 &&
+          ! grep -q '^ge' "$HOME/.bl-proton-extra" 2>/dev/null; then
+         echo ge >> "$HOME/.bl-proton-extra"
+       fi
+diff --git a/tools/linuxfs/overlay/usr/local/bin/droiddeck-steam-x64 b/tools/linuxfs/overlay/usr/local/bin/droiddeck-steam-x64
+index 481d25d..c370fe7 100755
+--- a/tools/linuxfs/overlay/usr/local/bin/droiddeck-steam-x64
++++ b/tools/linuxfs/overlay/usr/local/bin/droiddeck-steam-x64
+@@ -24,7 +24,10 @@ x64_default_dir() {
+            ls -d "$STEAM_X64"/compatibilitytools.d/GE-Proton*-aarch64 2>/dev/null | sort -V -r)
+   echo "$STEAM_X64/compatibilitytools.d/droiddeck-proton-arm64"
+ }
++# Every arm64 Proton build uses ARMv8.1 atomics, so an ARMv8.0 CPU runs Valve's x86-64 Proton under FEX.
++X64_ARMV80_TOOL=proton_experimental
+ x64_default_tool() {
++  if ! x64_arm64_builds_supported; then echo "$X64_ARMV80_TOOL"; return; fi
+   sed -n 's/^[[:space:]]*"\([^"]*\)"[[:space:]]*$/\1/p' "$(x64_default_dir)/compatibilitytool.vdf" 2>/dev/null |
+     grep -v -x -e compatibilitytools -e compat_tools | head -n 1
+ }
+@@ -533,12 +536,17 @@ RUN
+   arm_tools=$ARM_STEAM/compatibilitytools.d
+   mkdir -p "$X64_HOME/arm64"
+   cp -f /usr/bin/env "$X64_HOME/arm64/env"
++  arm64_builds=1
++  if ! x64_arm64_builds_supported; then
++    arm64_builds=0
++    step "this CPU has no ARMv8.1 atomics: arm64 Proton cannot run here, so Windows games use $X64_ARMV80_TOOL under FEX"
++  fi
+   for w in "$STEAM_X64"/compatibilitytools.d/*/.droiddeck-arm64-proton; do
+     [ -e "$w" ] || continue
+     d=${w%/.droiddeck-arm64-proton}
+-    [ -d "$arm_tools/${d##*/}" ] && [ "${d##*/}" != droiddeck-fex ] || rm -rf "$d"
++    [ "$arm64_builds" = 1 ] && [ -d "$arm_tools/${d##*/}" ] && [ "${d##*/}" != droiddeck-fex ] || rm -rf "$d"
+   done
+-  for src in "$arm_tools"/*/; do
++  if [ "$arm64_builds" = 1 ]; then for src in "$arm_tools"/*/; do
+     src=${src%/}; name=${src##*/}
+     [ -f "$src/compatibilitytool.vdf" ] && [ -f "$src/toolmanifest.vdf" ] || continue
+     case $name in droiddeck-direct|droiddeck-fex) continue ;; esac
+@@ -571,7 +579,7 @@ VDF
+     printf '#!/bin/sh\n# The arm64 client'"'"'s %s, run natively (droiddeck-x64-arm-proton).\nexec "%s" /usr/local/bin/droiddeck-x64-arm-proton "%s" "$@"\n' \
+       "$name" "$X64_HOME/arm64/env" "$name" > "$dst/run"
+     chmod 755 "$dst/run"
+-  done
++  done; fi
+   x64_sync_login
+   if ! pgrep -f 'steamrt64/steam( |$)' >/dev/null 2>&1; then
+     listing_ok=0
+@@ -621,13 +629,12 @@ PY
+         step "could not add the card to the x86-64 client's library folders"
+     fi
+   fi
+-  default=$(x64_default_dir)
+-  if [ -f "$default/compatibilitytool.vdf" ] && [ -f "$STEAM_X64/config/config.vdf" ] &&
++  default_tool=$(x64_default_tool)
++  if [ -n "$default_tool" ] && [ -f "$STEAM_X64/config/config.vdf" ] &&
+      ! pgrep -f 'steamrt64/steam( |$)' >/dev/null 2>&1; then
+-    python3 - "$STEAM_X64/config/config.vdf" "$default/compatibilitytool.vdf" "$X64_HOME/default-tool" <<'PY' || step "could not make ARM64 Proton the default"
++    python3 - "$STEAM_X64/config/config.vdf" "$default_tool" "$X64_HOME/default-tool" <<'PY' || step "could not make $default_tool the default compatibility tool"
+ import os, re, sys
+-path, vdf, record = sys.argv[1:4]
+-tool = re.search(r'"compat_tools"\s*\{\s*"([^"]+)"', open(vdf).read()).group(1)
++path, tool, record = sys.argv[1:4]
+ s = open(path, encoding="utf-8", errors="surrogateescape").read()
+ m = re.search(r'"CompatToolMapping"\s*\{', s)
+ if not m:
+@@ -787,6 +794,9 @@ x64_arm_webhelper_cpu_supported() {
+   [ "$status" != 1 ]
+ }
+ 
++# Valve's arm64 client, web helper and every arm64 Proton build need the same LSE atomics.
++x64_arm64_builds_supported() { x64_arm_webhelper_cpu_supported; }
++
+ x64_exec() {
+   x64_env
+   cd "$STEAM_X64"
+diff --git a/tools/linuxfs/overlay/usr/local/bin/steam-compatibility b/tools/linuxfs/overlay/usr/local/bin/steam-compatibility
+index 4a2cbcb..c4dd6cd 100755
+--- a/tools/linuxfs/overlay/usr/local/bin/steam-compatibility
++++ b/tools/linuxfs/overlay/usr/local/bin/steam-compatibility
+@@ -1669,9 +1669,19 @@ def x64_repoint(steam_root, tool, live=False):
+     moved = []
+     current = read_mapping(tokens, mapping)
+     changes = {} if "0" in current else {"0": tool}
++    # Valve's x86-64 Proton as the target means an ARMv8.0 CPU: only arm64 tools, which cannot run
++    # there, are moved, and a title's own x86-64 Proton choice is kept.
++    x86_target = tool.lower().startswith("proton_")
+     for app, name in current.items():
+         named = name.lower()
+         legacy = named == "droiddeck-proton-arm64"
++        if x86_target:
++            arm64 = legacy or (re.search(r"(a64|arm64|aarch64)$", named) is not None and named not in keep)
++            if arm64 and named != tool.lower():
++                changes[app] = tool
++                if app != "0":
++                    moved.append(app)
++            continue
+         if (named.startswith("proton") or legacy) and named != tool.lower() \
+                 and (legacy or named not in keep):
+             changes[app] = tool
+diff --git a/tools/tests/test_armv80_steam.py b/tools/tests/test_armv80_steam.py
+new file mode 100644
+index 0000000..1639061
+--- /dev/null
++++ b/tools/tests/test_armv80_steam.py
+@@ -0,0 +1,182 @@
++"""ARMv8.0 CPUs (no LSE atomics, e.g. Snapdragon 685) cannot run Valve's arm64 Steam client or any arm64
++Proton build, so the x86-64 client must use Valve's x86-64 Proton under FEX there."""
++import os
++from pathlib import Path
++import runpy
++import subprocess
++import tempfile
++import unittest
++
++BIN = Path(__file__).resolve().parents[1] / 'linuxfs/overlay/usr/local/bin'
++X64 = (BIN / 'droiddeck-steam-x64').read_text()
++SESSION = (BIN / 'droiddeck-session').read_text()
++COMPAT = runpy.run_path(str(BIN / 'steam-compatibility'))
++
++SD685 = ('processor : 0\nFeatures : fp asimd evtstrm aes pmull sha1 sha2 crc32 cpuid\n'
++         'processor : 4\nFeatures : fp asimd evtstrm aes pmull sha1 sha2 crc32 cpuid\n')
++LSE = 'processor : 0\nFeatures : fp asimd evtstrm aes pmull sha1 sha2 crc32 atomics fphp asimdhp cpuid asimdrdm lrcpc dcpop asimddp\n'
++
++
++def between(text, start, end):
++    begin = text.index(start)
++    return text[begin:text.index(end, begin)]
++
++
++def tool_vdf(key):
++    return '"compatibilitytools"\n{\n  "compat_tools"\n  {\n    "%s"\n    {\n      "install_path" "."\n    }\n  }\n}\n' % key
++
++
++class Armv80Case(unittest.TestCase):
++    def setUp(self):
++        self.tmp = tempfile.TemporaryDirectory()
++        self.root = Path(self.tmp.name)
++        self.cpuinfo = self.root / 'cpuinfo'
++
++    def tearDown(self):
++        self.tmp.cleanup()
++
++    def bash(self, script, env=None, cpuinfo=None):
++        if cpuinfo is not None:
++            self.cpuinfo.write_text(cpuinfo)
++        script = script.replace('/proc/cpuinfo', str(self.cpuinfo))
++        result = subprocess.run(['bash', '-eu', '-c', script], env=dict(os.environ, **(env or {})),
++                                capture_output=True, text=True)
++        return result
++
++
++class SessionCpuTest(Armv80Case):
++    def armv80(self, cpuinfo):
++        helper = between(SESSION, 'bl_cpu_armv80() {', 'steam_setup_failed() {')
++        return self.bash(helper + '\nif bl_cpu_armv80; then echo yes; else echo no; fi\n', cpuinfo=cpuinfo).stdout.strip()
++
++    def test_snapdragon_685_is_armv80(self):
++        self.assertEqual(self.armv80(SD685), 'yes')
++
++    def test_lse_cpu_is_not(self):
++        self.assertEqual(self.armv80(LSE), 'no')
++
++    def test_one_core_without_atomics_is_enough(self):
++        self.assertEqual(self.armv80('Features : fp atomics\nFeatures : fp asimd\n'), 'yes')
++
++    def test_no_feature_lines_or_no_file_says_no(self):
++        self.assertEqual(self.armv80('processor : 0\n'), 'no')
++        self.assertEqual(self.bash(between(SESSION, 'bl_cpu_armv80() {', 'steam_setup_failed() {') +
++                                   '\nif bl_cpu_armv80; then echo yes; else echo no; fi\n').stdout.strip(), 'no')
++
++    def test_session_skips_arm64_downloads_on_armv80(self):
++        steam = between(SESSION, '    steam_x64=0\n', '    if [ -s "$HOME/.bl-proton-extra" ]; then')
++        self.assertIn('if [ "$_bl_armv80" = 1 ]; then', steam)
++        self.assertIn('if [ "$_bl_armv80" = 0 ] &&', steam)
++
++
++class X64DefaultToolTest(Armv80Case):
++    def default_tool(self, cpuinfo):
++        steam = self.root / 'x64'
++        bridged = steam / 'compatibilitytools.d/GE-Proton11-7-aarch64'
++        bridged.mkdir(parents=True, exist_ok=True)
++        (bridged / '.droiddeck-arm64-proton').touch()
++        (bridged / 'compatibilitytool.vdf').write_text(tool_vdf('GE-Proton11-7-a64'))
++        functions = (between(X64, 'x64_default_dir() {', 'x64_client_parts() {') +
++                     between(X64, 'x64_arm_webhelper_cpu_supported() {', 'x64_exec() {'))
++        result = self.bash(functions + '\nx64_default_tool\n', env={'STEAM_X64': str(steam)}, cpuinfo=cpuinfo)
++        self.assertEqual(result.returncode, 0, result.stderr)
++        return result.stdout.strip()
++
++    def test_armv80_defaults_to_valve_x64_proton(self):
++        self.assertEqual(self.default_tool(SD685), 'proton_experimental')
++
++    def test_lse_cpu_keeps_the_bridged_arm64_proton(self):
++        self.assertEqual(self.default_tool(LSE), 'GE-Proton11-7-a64')
++
++    def test_unknown_cpu_keeps_previous_behaviour(self):
++        self.assertEqual(self.default_tool('processor : 0\n'), 'GE-Proton11-7-a64')
++
++
++class X64BridgeTest(Armv80Case):
++    def bridge(self, supported):
++        arm = self.root / 'arm'
++        x64 = self.root / 'x64'
++        home = self.root / 'home'
++        ge = arm / 'compatibilitytools.d/GE-Proton11-7-aarch64'
++        ge.mkdir(parents=True)
++        (ge / 'compatibilitytool.vdf').write_text(tool_vdf('GE-Proton11-7-aarch64'))
++        (ge / 'toolmanifest.vdf').write_text('"manifest"\n{\n}\n')
++        stale = x64 / 'compatibilitytools.d/GE-Proton11-7-aarch64'
++        stale.mkdir(parents=True)
++        (stale / '.droiddeck-arm64-proton').touch()
++        (home / 'arm64').mkdir(parents=True)
++        loop = between(X64, '  arm64_builds=1\n', '  x64_sync_login\n')
++        script = ('step() { echo "STEP $*"; }\nx64_arm64_builds_supported() { %s; }\n' % ('true' if supported else 'false') +
++                  'arm_tools=$ARM_STEAM/compatibilitytools.d\n' + loop)
++        result = self.bash(script, env={'STEAM_X64': str(x64), 'ARM_STEAM': str(arm), 'X64_HOME': str(home),
++                                        'X64_ARMV80_TOOL': 'proton_experimental'})
++        self.assertEqual(result.returncode, 0, result.stderr)
++        return result.stdout, sorted(p.parent.name for p in (x64 / 'compatibilitytools.d').glob('*/.droiddeck-arm64-proton'))
++
++    def test_armv80_removes_and_skips_every_arm64_proton_bridge(self):
++        out, bridged = self.bridge(False)
++        self.assertEqual(bridged, [])
++        self.assertIn('no ARMv8.1 atomics', out)
++
++    def test_lse_cpu_bridges_the_arm64_proton(self):
++        out, bridged = self.bridge(True)
++        self.assertEqual(bridged, ['GE-Proton11-7-aarch64'])
++        run = (self.root / 'x64/compatibilitytools.d/GE-Proton11-7-aarch64/run').read_text()
++        self.assertIn('droiddeck-x64-arm-proton', run)
++
++
++CONFIG = '''"InstallConfigStore"
++{
++\t"Software"
++\t{
++\t\t"Valve"
++\t\t{
++\t\t\t"Steam"
++\t\t\t{
++\t\t\t\t"CompatToolMapping"
++\t\t\t\t{
++%s\t\t\t\t}
++\t\t\t}
++\t\t}
++\t}
++}
++'''
++ENTRY = '\t\t\t\t\t"%s"\n\t\t\t\t\t{\n\t\t\t\t\t\t"name"\t\t"%s"\n\t\t\t\t\t\t"config"\t\t""\n\t\t\t\t\t\t"priority"\t\t"250"\n\t\t\t\t\t}\n'
++
++
++class X64RepointArmv80Test(unittest.TestCase):
++    def setUp(self):
++        self.home = tempfile.TemporaryDirectory()
++        self.root = Path(self.home.name) / 'Steam'
++        (self.root / 'config').mkdir(parents=True)
++        entries = [('550', 'proton_9'), ('620', 'GE-Proton11-7-a64'), ('880', 'droiddeck-proton-arm64'),
++                   ('730', 'steamlinuxruntime'), ('990', 'proton_experimental')]
++        (self.root / 'config/config.vdf').write_text(CONFIG % ''.join(ENTRY % e for e in entries))
++        self.old_home = os.environ.get('HOME')
++        os.environ['HOME'] = self.home.name
++
++    def tearDown(self):
++        if self.old_home is None:
++            os.environ.pop('HOME', None)
++        else:
++            os.environ['HOME'] = self.old_home
++        self.home.cleanup()
++
++    def mapping(self):
++        tokens = COMPAT['tokenize']((self.root / 'config/config.vdf').read_text())
++        return COMPAT['read_mapping'](tokens, COMPAT['mapping_block'](tokens))
++
++    def test_only_arm64_tools_move_to_valve_x64_proton(self):
++        moved = COMPAT['x64_repoint'](str(self.root), 'proton_experimental')
++        self.assertEqual(sorted(moved), ['620', '880'])
++        m = self.mapping()
++        self.assertEqual(m['0'], 'proton_experimental')
++        self.assertEqual(m['550'], 'proton_9')
++        self.assertEqual(m['620'], 'proton_experimental')
++        self.assertEqual(m['730'], 'steamlinuxruntime')
++        self.assertEqual(m['880'], 'proton_experimental')
++        self.assertEqual(m['990'], 'proton_experimental')
++
++
++if __name__ == '__main__':
++    unittest.main()
+-- 
+2.43.0
+

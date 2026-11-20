@@ -1,0 +1,33 @@
+From a518b7fadda6aac8a0ff18d40479f91810afd205 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 20 Nov 2026 20:37:33 +0000
+Subject: [PATCH 3/8] build: fetch the pinned Venus component when staging a
+ release, as CI does
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ tools/sd685/stage_release_inputs.sh | 11 ++++++++++-
+ 1 file changed, 10 insertions(+), 1 deletion(-)
+
+diff --git a/tools/sd685/stage_release_inputs.sh b/tools/sd685/stage_release_inputs.sh
+index 8739879..33019be 100755
+--- a/tools/sd685/stage_release_inputs.sh
++++ b/tools/sd685/stage_release_inputs.sh
+@@ -62,4 +62,13 @@ for name in proot directaudio xbox comet powervr; do
+     zstd -dc "$archive" | tar -xf - -C "$dest"
+     echo "pack $name ${sha:0:16} -> ${pack_dest[$name]}"
+ done
+-echo "staged: $(find "$assets/linuxfs" -type f | wc -l) linuxfs files, esync packs, pulseaudio bundle, turnip archives, jniLibs, add-on packs"
++# The Mali (Venus) component, fetched and checked the way .github/workflows/build.yml does.
++. "$repo_root/tools/venus/release.env"
++curl -fsSL --retry 4 -o "$work/venus.tzst" "https://github.com/${VENUS_REPO}/releases/download/${VENUS_TAG}/venus.tzst"
++echo "${VENUS_SHA256}  $work/venus.tzst" | sha256sum -c --quiet
++zstd -dc "$work/venus.tzst" | tar -xf - -C "$repo_root/app/src/main"
++test -f "$jni/libvirgl_test_server.so"
++test -f "$assets/venus/libvulkan_virtio.so"
++echo "venus ${VENUS_TAG} ${VENUS_SHA256:0:16}"
++
++echo "staged: $(find "$assets/linuxfs" -type f | wc -l) linuxfs files, esync packs, pulseaudio bundle, turnip archives, jniLibs, add-on packs, venus"
+-- 
+2.43.0
+

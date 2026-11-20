@@ -1,0 +1,142 @@
+From 4ccc06ae778dcc3188117c2dcfae5fb4e5262a32 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 20 Nov 2026 20:17:31 +0000
+Subject: [PATCH 1/8] build: stage an official release's unmodified native
+ inputs and pin its add-on packs
+
+tools/sd685/stage_release_inputs.sh fills the generated, git-ignored inputs that
+tools/build_local.sh builds through Docker with the byte-identical files of a
+release APK built from the same commit, and fetches that release's add-on packs
+by digest. -PaddonPackPins makes BuildConfig name the same packs as the release.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ app/build.gradle                         | 12 +++++
+ tools/sd685/addon-packs-0.7.1.properties | 17 +++++++
+ tools/sd685/stage_release_inputs.sh      | 63 ++++++++++++++++++++++++
+ 3 files changed, 92 insertions(+)
+ create mode 100644 tools/sd685/addon-packs-0.7.1.properties
+ create mode 100755 tools/sd685/stage_release_inputs.sh
+
+diff --git a/app/build.gradle b/app/build.gradle
+index c87e709..7f5377c 100644
+--- a/app/build.gradle
++++ b/app/build.gradle
+@@ -93,10 +93,22 @@ def trackingPack = rootProject.file('tools/packs/tracking/release.env').readLine
+ def prootPackPin = rootProject.file('tools/packs/proot/release.env').readLines()
+     .findAll { it.contains('=') && !it.startsWith('#') }
+     .collectEntries { def kv = it.split('=', 2); [(kv[0].trim()): kv[1].trim()] }
++// Pins the packs a release published (tools/sd685/addon-packs-<version>.properties), so a build that
++// does not rebuild them downloads and verifies the same archives as that release.
++def addonPackPinsPath = project.findProperty('addonPackPins') ?: localBuildOptions.getProperty('droiddeck.addonPackPins', '')
++def addonPackPins = new Properties()
++if (addonPackPinsPath) {
++    def pinsFile = rootProject.file(addonPackPinsPath)
++    if (!pinsFile.isFile()) throw new GradleException("addonPackPins file ${pinsFile} does not exist")
++    addonPackPins.load(new StringReader(providers.fileContents(rootProject.layout.projectDirectory.file(addonPackPinsPath)).asText.get()))
++}
+ def addonPacks = ['proot', 'directaudio', 'tracking', 'xbox', 'comet', 'butler', 'powervr'].collectEntries { name ->
+     def pack = file("build/packs/${name}.tar.zst")
+     if (!pack.isFile()) {
+         if (ciBuild) throw new GradleException("Add-on pack ${pack} is missing: run tools/packs/build.sh app/build/packs")
++        if (addonPackPins.getProperty("${name}.sha256")) {
++            return [(name): [sha256: addonPackPins.getProperty("${name}.sha256"), size: (addonPackPins.getProperty("${name}.size") ?: '0') as long]]
++        }
+         if (name == 'proot' && prootPackPin.PROOT_PACK_SHA256) {
+             return [(name): [sha256: prootPackPin.PROOT_PACK_SHA256, size: (prootPackPin.PROOT_PACK_SIZE ?: '0') as long]]
+         }
+diff --git a/tools/sd685/addon-packs-0.7.1.properties b/tools/sd685/addon-packs-0.7.1.properties
+new file mode 100644
+index 0000000..4920eba
+--- /dev/null
++++ b/tools/sd685/addon-packs-0.7.1.properties
+@@ -0,0 +1,17 @@
++# Add-on packs of the official DroidDeck 0.7.1 (19) release, read from its BuildConfig.
++# The app downloads them from Droid-Deck/DroidDeck-Components (tag pack-<name>-<sha256[0:16]>)
++# and checks them against these digests.
++proot.sha256=6d3844bbcdc10d2cd237f35d858a1cf3e3b493bfe17c9466952caa584dc78a96
++proot.size=99210
++directaudio.sha256=fc3deada9eb56deca7a8f930c193ad9dbcf2a2c0f4fe094edcf905a82550b33f
++directaudio.size=22583
++tracking.sha256=968fcb3ff812c26d7f8421a2584cf42498458004c08c6f28900b09c0f4432415
++tracking.size=25576818
++xbox.sha256=24cb41e2e9901fd269471d9270f1699731b73f26a8e4e80eec6bdf88eadf0ac2
++xbox.size=14259109
++comet.sha256=73cca25e9c2b9506737ff6c9714d20c74b2a2bd5036fdfbbd4d9d8c1942a103a
++comet.size=4187027
++butler.sha256=f09fe478841a79a43267fce9050235c34207020274b8f62afe811dbe7bb725cf
++butler.size=7855451
++powervr.sha256=e695d3a8efd5edce13db3236a94bb5181286c6517cbfd60f99eda76d2997033b
++powervr.size=33600870
+diff --git a/tools/sd685/stage_release_inputs.sh b/tools/sd685/stage_release_inputs.sh
+new file mode 100755
+index 0000000..dc736bb
+--- /dev/null
++++ b/tools/sd685/stage_release_inputs.sh
+@@ -0,0 +1,63 @@
++#!/usr/bin/env bash
++# Stages the prebuilt, unmodified native inputs of an official DroidDeck APK into the generated
++# (git-ignored) paths that tools/build_local.sh normally fills through Docker cross-builds.
++# Only use an APK built from the same source commit: these files are taken byte for byte.
++#
++#   tools/sd685/stage_release_inputs.sh DroidDeck-0.7.1.apk
++#
++# Session scripts are not taken from the APK: Gradle's stageSessionScripts copies them from
++# tools/linuxfs/overlay, so source changes there always reach the built APK.
++set -euo pipefail
++
++apk=${1:?usage: stage_release_inputs.sh <official apk>}
++repo_root=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
++work=$(mktemp -d)
++trap 'rm -rf "$work"' EXIT
++
++unzip -q "$apk" 'assets/*' 'lib/*' -d "$work"
++
++assets=$repo_root/app/src/main/assets
++prepared=$repo_root/app/build/prepared-assets
++jni=$repo_root/app/src/main/jniLibs/arm64-v8a
++
++rm -rf "$assets/linuxfs" "$assets/droiddeck-esync"
++mkdir -p "$assets" "$prepared/graphics_driver" "$jni"
++cp -a "$work/assets/linuxfs" "$assets/linuxfs"
++cp -a "$work/assets/droiddeck-esync" "$assets/droiddeck-esync"
++cp -f "$work/assets/pulseaudio.tzst" "$prepared/pulseaudio.tzst"
++for name in turnip25.1.0-quest1 turnip26.3.0-a6xx turnip26.3.0-quest2; do
++    cp -f "$work/assets/graphics_driver/adrenotools-$name.tzst" "$prepared/graphics_driver/"
++done
++for lib in libdirectaudiorelay.so libsyncthingnative.so; do
++    install -m755 "$work/lib/arm64-v8a/$lib" "$jni/$lib"
++done
++if [[ "${STAGE_STORES:-0}" == 1 ]]; then
++    mkdir -p "$repo_root/app/build/rustJniLibs/arm64-v8a"
++    install -m755 "$work/lib/arm64-v8a/libdroiddeckstores.so" "$repo_root/app/build/rustJniLibs/arm64-v8a/"
++fi
++
++# The add-on packs are not in the APK; the app downloads them by digest. Their contents are
++# runtime inputs the build verifies, so fetch the release's own archives and unpack them in place.
++pins=${PACK_PINS:-$repo_root/tools/sd685/addon-packs-0.7.1.properties}
++pin() { sed -n "s/^$1\\.$2=//p" "$pins"; }
++declare -A pack_dest=(
++    [proot]=app/src/main/jniLibs/arm64-v8a
++    [directaudio]=app/src/main/assets/directaudio
++    [xbox]=app/src/main/assets/linuxfs/usr/local/lib/droiddeck-xbox
++    [comet]=app/src/main/assets/linuxfs/usr/local/lib/droiddeck-comet
++    [powervr]=app/src/main/assets/hybris
++)
++for name in proot directaudio xbox comet powervr; do
++    sha=$(pin "$name" sha256)
++    [[ -n "$sha" ]] || { echo "no pin for the $name pack in $pins" >&2; exit 1; }
++    archive=$work/$name.tar.zst
++    curl -fsSL --retry 4 -o "$archive" \
++        "https://github.com/Droid-Deck/DroidDeck-Components/releases/download/pack-$name-${sha:0:16}/$name.tar.zst"
++    echo "$sha  $archive" | sha256sum -c --quiet
++    dest=$repo_root/${pack_dest[$name]}
++    [[ "$name" == proot ]] || rm -rf "$dest"
++    mkdir -p "$dest"
++    zstd -dc "$archive" | tar -xf - -C "$dest"
++    echo "pack $name ${sha:0:16} -> ${pack_dest[$name]}"
++done
++echo "staged: $(find "$assets/linuxfs" -type f | wc -l) linuxfs files, esync packs, pulseaudio bundle, turnip archives, jniLibs, add-on packs"
+-- 
+2.43.0
+

@@ -1,0 +1,43 @@
+# GE-Proton11-7-aarch64 (github.com/GloriousEggroll/proton-ge-custom, release GE-Proton11-7)
+== bin-arm64/wine
+   ARMv8.0-clean (no v8.1+ instructions found)
+== bin-arm64/wineserver
+   LSE atomics (v8.1): 4 unguarded
+      e.g. 0x3eb7c casal x8, x0, [x9] in <get_shm>
+== lib/wine/aarch64-unix/ntdll.so
+   LSE atomics (v8.1): 99 unguarded
+      e.g. 0x10f60 ldaddal w9, w8, [x8] in <__wine_dbg_ftrace>
+== lib/wine/aarch64-unix/libarm64ecfex.so
+   ARMv8.0-clean (no v8.1+ instructions found)
+== lib/wine/aarch64-windows/ntdll.dll
+   LSE atomics (v8.1): 244 unguarded
+      e.g. 0x180026b00 ldaddal w9, w8, [x8] in <actctx_release>
+== lib/wine/aarch64-windows/kernelbase.dll
+   LSE atomics (v8.1): 55 unguarded
+      e.g. 0x18002ac2c casal x8, x0, [x9] in <$ehgcr_10_6>
+== lib/wine/aarch64-windows/libarm64ecfex.dll
+   LSE atomics (v8.1): 66 unguarded
+      e.g. 0x1800029d4 ldadd x8, x8, [x9] in <_Z26ResetToConsistentStateImpl13ThreadCPUAreaP17_EXCEPTION_RECORDP8_CONTEXTP17_ARM64_NT_CONTEXT>
+   SVE/SVE2: 1 unguarded
+      e.g. 0x1801ca2b0 rdvl x0, #0x8 in <_ZN3FEXL25ReadSVEVectorLengthInBitsEv>
+== lib/wine/aarch64-windows/libwow64fex.dll
+   LSE atomics (v8.1): 58 unguarded
+      e.g. 0x180003790 ldadd x8, x8, [x9] in <_Z31BTCpuResetToConsistentStateImplP19_EXCEPTION_POINTERS>
+   SVE/SVE2: 2 unguarded
+      e.g. 0x1801af548 cntd x0 in <_ZNK9libunwind15Registers_arm6411getRegisterEi>
+== lib/wine/dxvk/aarch64-windows/d3d11.dll
+   LSE atomics (v8.1): 11484 unguarded
+      e.g. 0x180003008 ldaddal w9, w8, [x8] in <.text>
+   SVE/SVE2: 1 unguarded
+      e.g. 0x1803b44fc cntd x0 in <D3D11On12CreateDevice>
+
+## wineserver get_shm:
+   3eb5c:      	b.eq	0x3ebe0 <get_shm+0x130>
+   3eb60:      	adrp	x8, 0xbf000 <status_names+0x1d0>
+   3eb64:      	ldr	x8, [x8, #0xe70]
+   3eb68:      	ldr	w8, [x8]
+   3eb6c:      	cbnz	w8, 0x3ec1c <get_shm+0x16c>
+   3eb70:      	ldr	x9, [x22, #0x150]
+   3eb74:      	mov	x8, xzr
+   3eb78:      	add	x9, x9, x19, lsl #3
+   3eb7c:      	casal	x8, x0, [x9]

@@ -1,0 +1,50 @@
+From a0d856214c9720b9d924d05ce524506fe402027d Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 20 Nov 2026 21:03:46 +0000
+Subject: [PATCH 8/8] docs: record the Snapdragon 685 SIGILL evidence and the
+ ARMv8.0 Steam and Proton paths
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ docs/development/steam-launch-hardware.md | 25 +++++++++++++++++++++++
+ 1 file changed, 25 insertions(+)
+
+diff --git a/docs/development/steam-launch-hardware.md b/docs/development/steam-launch-hardware.md
+index 234dede..ea1cf5d 100644
+--- a/docs/development/steam-launch-hardware.md
++++ b/docs/development/steam-launch-hardware.md
+@@ -30,6 +30,31 @@ include that exact flag; absent or unreadable feature data retains the prior
+ behavior. Explicit x86-helper selection and the client-build matching rule
+ remain unchanged.
+ 
++### Confirmed on a Redmi Note 13 (Snapdragon 685, Cortex-A73/A53)
++
++A second report has the same shape: Adreno 610 selected, the arm64 client exits with 132 within a
++second of `starting the Steam client`. Its CPU `Features` list is
++`fp asimd evtstrm aes pmull sha1 sha2 crc32 cpuid`: no `atomics`. Disassembling the arm64 client
++(`steam_client_steamdeck_publicbeta_linuxarm64` 1793740892) shows why it cannot start there:
++`libtier0_s.so`'s `ThreadInterlockedIncrement` is `ldaddal` and `ThreadInterlockedCompareExchange` is
++`casal`, with no HWCAP check before them; `steamclient.so` has 5888 such LSE instructions and
++`steamui.so` 4470. The same holds for every arm64 Proton: Proton's `Makefile.in` builds aarch64 with
++`-march=armv8.2-a`, and GE-Proton11-7-aarch64's `wineserver` (`casal` in `get_shm`), `ntdll.so`,
++`ntdll.dll` and DXVK's `d3d11.dll` carry unguarded LSE atomics. DroidDeck's own ARM64 binaries use
++outline atomics and run on ARMv8.0; FEX-2610 requires only ARMv8.0 with FP and CRC32.
++
++So on a CPU whose kernel reports no `atomics` (`CpuFeatures`, from `HWCAP_ATOMICS` in
++`/proc/self/auxv`, then `/proc/cpuinfo`):
++
++- the x86-64 client is always used, and the client choice offers only it, with the reason;
++- the x86-64 client bridges no arm64 Proton and writes `droiddeck-proton-x64`, which starts Valve's
++  x86-64 Proton under FEX without the Steam Linux Runtime container (proot gives it no namespaces, the
++  reason Linux games already use `droiddeck-direct`); it becomes the default and Proton Experimental is
++  requested when none is installed;
++- the session skips the GE-Proton aarch64 download and the arm64 client update it cannot use.
++
++Absent or unreadable feature data keeps every previous behaviour. Not yet verified on the device.
++
+ ## gamescope cannot find a Vulkan device (#1368)
+ 
+ The [MT6993 report](https://github.com/Droid-Deck/DroidDeck/issues/1368) shows a
+-- 
+2.43.0
+
