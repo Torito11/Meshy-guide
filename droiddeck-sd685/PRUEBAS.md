@@ -20,7 +20,7 @@ NDK 27.3.13750724, CMake 3.22.1, Rust 1.97 + cargo-ndk 4.1.2.
 | Tests Python del proyecto (2.127) | ✅ Todos los relacionados pasan; 4 fallos ajenos al cambio (ver abajo) |
 | Tests nuevos (Python 14, Kotlin 13) | ✅ Todos pasan |
 | Tests Kotlin dirigidos (39) | ✅ Todos pasan |
-| Suite Kotlin completa | ver sección 4 |
+| Suite Kotlin completa del proyecto (3.860 tests, 513 clases) | ✅ 0 fallos, 0 errores (10 omitidos por el proyecto) |
 | Instalar y abrir en un teléfono/emulador | ❌ **No realizado**: sin dispositivo y sin KVM |
 | Steam x86-64 / Proton x86-64 / Xbox en el Redmi Note 13 | ❌ **No verificado en el dispositivo** |
 
@@ -85,7 +85,8 @@ documentación).
 - **Kotlin dirigidos (39)**: `CpuFeaturesTest`, `LowTierSessionPrefsTest`, `DeviceReportCpuTest`,
   `SettingsResetTest`, `XboxCloudTest`, `SessionLaunchFailureTest`, `CoreAllocationPrefsTest`,
   `SessionScalingPrefsTest`: todos pasan.
-- **Kotlin, suite completa**: RESULTADO_SUITE_KOTLIN
+- **Kotlin, suite completa** (`./gradlew -PskipRust=true :app:testDebugUnitTest`): 513 clases, 3.860 tests,
+  **0 fallos, 0 errores**, 10 omitidos (marcados así en el propio proyecto). Incluye los 13 tests nuevos.
 
 ## 5. Lo que NO se pudo probar (y por qué)
 

@@ -19,7 +19,8 @@ con cualquier juego de Windows.
 | [`PRUEBAS.md`](PRUEBAS.md) | Informe de pruebas: qué se probó, resultados y qué no se pudo probar |
 | [`INSTALACION.md`](INSTALACION.md) | Instalación, primer uso, ajustes recomendados, actualización y cómo volver atrás |
 | [`COMPATIBILIDAD.md`](COMPATIBILIDAD.md) | Qué juegos pueden funcionar, Steam vs Xbox Cloud, límites del hardware |
-| `apk/` | La APK compilada y su `SHA256SUMS` |
+| `apk/` | La APK compilada (`DroidDeck-0.7.1-sd685.apk`) y su `SHA256SUMS` |
+| `fuentes/` | Código fuente modificado y **copia de seguridad del original** (`.tar.gz`) |
 | `patches/` | Las modificaciones como parches `git am` sobre la etiqueta oficial `0.7.1` |
 | `build/rebuild.sh` | Reconstrucción reproducible desde el código oficial + parches |
 | `evidencia/` | Escaneos de instrucciones de los binarios (Steam ARM64, GE-Proton aarch64, APK) y el escáner |
@@ -49,8 +50,10 @@ Las funciones originales se conservan (Xbox, tiendas, escritorio, etc.). No requ
 
 - Código original: etiqueta pública `0.7.1` de github.com/Droid-Deck/DroidDeck (commit `cdff94e72c45da50af43bbceff28effaf0179caf`).
 - APK original: `DroidDeck-0.7.1.apk` de las releases oficiales, SHA-256 `179ab8b4dc8f9223b70a1e4287c55a090b36ee376242186a60211100158462f1`.
-- Se entregan además los archivos `DroidDeck-0.7.1-original-src.tar.gz` y `DroidDeck-0.7.1-sd685-src.tar.gz`
+- `fuentes/DroidDeck-0.7.1-original-src.tar.gz` y `fuentes/DroidDeck-0.7.1-sd685-src.tar.gz`
   (código sin los GIF/vídeos de la documentación).
+- Nota: esta rama contiene binarios grandes (APK de 92 MB y fuentes); es una rama de entrega, no conviene
+  fusionarla en `main` de la guía.
 
 Licencia: GPL-3.0, como el proyecto original. Steam y Proton son de Valve; Xbox es de Microsoft. Proyecto
 no afiliado a ninguno de ellos.
