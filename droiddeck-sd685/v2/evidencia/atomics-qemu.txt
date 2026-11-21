@@ -1,0 +1,45 @@
+# tools/armv80/tests/atomics.c: las 63 formas LSE, min/max, registros sucios, base SP + flags, CAS de 128 bits, 4 hilos en contencion
+# QEMU user; cortex-a53 = sin LSE (como Cortex-A53/A73 del Snapdragon 685); max = con LSE
+
+== orig_cortex-a53
+qemu: uncaught target signal 4 (Illegal instruction) - core dumped
+
+== orig_max
+u8 5dd6c57f186f6ac8
+u16 4d45b0422e2b923f
+u32 e4ca0910d55927a0
+u64 ce6139c146528122
+minmax 1099e02663ec178a
+dirty 77f0693f42556a32
+stack d058fdb7aace7405
+threads 800000 800000
+
+== out_atomics_static_v80_cortex-a53
+u8 5dd6c57f186f6ac8
+u16 4d45b0422e2b923f
+u32 e4ca0910d55927a0
+u64 ce6139c146528122
+minmax 1099e02663ec178a
+dirty 77f0693f42556a32
+stack d058fdb7aace7405
+threads 800000 800000
+
+== out_atomics_dyn_v80_cortex-a53
+u8 5dd6c57f186f6ac8
+u16 4d45b0422e2b923f
+u32 e4ca0910d55927a0
+u64 ce6139c146528122
+minmax 1099e02663ec178a
+dirty 77f0693f42556a32
+stack d058fdb7aace7405
+threads 800000 800000
+
+== out_atomics_dyn_v80_max
+u8 5dd6c57f186f6ac8
+u16 4d45b0422e2b923f
+u32 e4ca0910d55927a0
+u64 ce6139c146528122
+minmax 1099e02663ec178a
+dirty 77f0693f42556a32
+stack d058fdb7aace7405
+threads 800000 800000

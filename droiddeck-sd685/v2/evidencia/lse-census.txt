@@ -1,0 +1,3 @@
+original DroidDeck-Proton 11-12.8    archivos con LSE en código:  688   instrucciones LSE:  53158
+reescrito ARMv8.0                    archivos con LSE en código:    0   instrucciones LSE:      0
+(15 s; recuento con tools/armv80/rewrite.py sobre segmentos/secciones ejecutables AArch64/ARM64EC)

@@ -1,0 +1,703 @@
+From ed0d0f0968b34d5f82d9d4448cb0fbc5556c847e Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 21 Nov 2026 03:59:17 +0000
+Subject: [PATCH 11/12] feat: performance profiles, a 30 Hz session cap and
+ thread hints beyond the Odin 3
+
+Seven profiles (Balanced, Performance, Battery saver, Compatibility, Xbox
+PC games, Xbox Cloud, Steam) set existing settings together: the session
+refresh cap, the FEX preset, the Steam client's cores (the efficiency
+cluster on big.LITTLE CPUs), thread hints, shader pre-caching and
+background downloads, and the Xbox Cloud stream. Changing any of them by
+hand shows the profile as custom. Nothing touches clocks, thermal limits
+or Android settings.
+
+- The session refresh cap offers 30 Hz, an exact divisor of 60 Hz.
+- Game thread performance hints can run on any SoC when a profile asks,
+  and stop at THERMAL_STATUS_SEVERE there (CRITICAL on the Odin 3).
+- Pinning the client can leave gamescope on every core.
+- The web Xbox Cloud player picks the lowest display mode that shows its
+  frame-rate limit, as the native player does.
+- -PreleaseVersionNameSuffix names a release build.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ app/build.gradle                              |   3 +-
+ .../droiddeck/launcher/FrontEndActivity.kt    |  23 ++-
+ .../com/droiddeck/launcher/core/CpuCores.kt   |  11 ++
+ .../launcher/core/PerformanceProfiles.kt      | 140 ++++++++++++++++++
+ .../launcher/session/GameThreadHints.kt       |  14 +-
+ .../launcher/session/SessionPrefs.kt          |  21 +++
+ .../launcher/session/SessionService.kt        |   1 +
+ .../launcher/session/SettingsReset.kt         |   1 +
+ .../stores/xbox/XboxCloudPlayerActivity.kt    |  14 ++
+ .../launcher/ui/ModeSettingsDialog.kt         |  38 ++++-
+ app/src/main/res/values-b+es+419/strings.xml  |  19 +++
+ app/src/main/res/values-es/strings.xml        |  19 +++
+ app/src/main/res/values/strings.xml           |  19 +++
+ .../launcher/core/PerformanceProfilesTest.kt  |  94 ++++++++++++
+ .../overlay/usr/local/bin/droiddeck-session   |   2 +-
+ 15 files changed, 407 insertions(+), 12 deletions(-)
+ create mode 100644 app/src/main/java/com/droiddeck/launcher/core/PerformanceProfiles.kt
+ create mode 100644 app/src/test/java/com/droiddeck/launcher/core/PerformanceProfilesTest.kt
+
+diff --git a/app/build.gradle b/app/build.gradle
+index 0f847bf..b6e115c 100644
+--- a/app/build.gradle
++++ b/app/build.gradle
+@@ -216,7 +216,8 @@ android {
+                 ?: localBuildOptions.getProperty('droiddeck.releaseApplicationIdSuffix', '')).toString()
+             if (releaseIdSuffix) {
+                 applicationIdSuffix releaseIdSuffix
+-                versionNameSuffix "-" + releaseIdSuffix.replaceFirst(/^\./, '')
++                def nameSuffix = (project.findProperty('releaseVersionNameSuffix') ?: "-" + releaseIdSuffix.replaceFirst(/^\./, '')).toString()
++                versionNameSuffix nameSuffix
+                 manifestPlaceholders = [appLabel: (project.findProperty('releaseAppLabel') ?: "DroidDeck ${releaseIdSuffix.replaceFirst(/^\./, '').toUpperCase()}").toString()]
+             }
+         }
+diff --git a/app/src/main/java/com/droiddeck/launcher/FrontEndActivity.kt b/app/src/main/java/com/droiddeck/launcher/FrontEndActivity.kt
+index 5d6567a..8b1b620 100644
+--- a/app/src/main/java/com/droiddeck/launcher/FrontEndActivity.kt
++++ b/app/src/main/java/com/droiddeck/launcher/FrontEndActivity.kt
+@@ -194,6 +194,7 @@ class FrontEndActivity : ComponentActivity() {
+     private var picturePosition by mutableStateOf("center")
+     private var stretch16x9 by mutableStateOf(false)
+     private var refreshCap by mutableStateOf(0)
++    private var performanceProfile by mutableStateOf(com.droiddeck.launcher.core.PerformanceProfiles.CUSTOM)
+     private var orientation by mutableStateOf(android.content.pm.ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE)
+     private var launcherOrientation by mutableStateOf(android.content.pm.ActivityInfo.SCREEN_ORIENTATION_USER)
+     private var launcherFullscreen by mutableStateOf(true)
+@@ -2262,7 +2263,10 @@ class FrontEndActivity : ComponentActivity() {
+                         fsyncFirst = SessionPrefs.fsyncFirst(this)
+                         syncFallback = SessionPrefs.syncFallback(this)
+                     },
+-                    onFexPreset = { id -> SessionPrefs.setFexPreset(this, id); fexPreset = id },
++                    onFexPreset = { id ->
++                        SessionPrefs.setFexPreset(this, id); fexPreset = id
++                        performanceProfile = com.droiddeck.launcher.core.PerformanceProfiles.current(this)
++                    },
+                     onForceSsbs = { on -> SessionPrefs.setForceSsbs(this, on); forceSsbs = on },
+                 )
+             },
+@@ -2406,6 +2410,7 @@ class FrontEndActivity : ComponentActivity() {
+                 picturePosition = if (mode == SessionService.MODE_STEAM) picturePosition else null,
+                 stretch16x9 = if (mode == SessionService.MODE_STEAM) stretch16x9 else null,
+                 refreshCap = refreshCap,
++                performanceProfile = performanceProfile,
+                 mic = if (mode == SessionService.MODE_STEAM) mic else null,
+                 gameStorage = if (mode == SessionService.MODE_STEAM) gameStorage else null,
+                 storageOptions = storageOptions,
+@@ -2466,7 +2471,15 @@ class FrontEndActivity : ComponentActivity() {
+                 onDirectAudio = { on -> SessionPrefs.setDirectAudio(this, on); directAudio = on },
+                 onPicturePosition = { value -> SessionPrefs.setPicturePosition(this, value); picturePosition = value },
+                 onStretch16x9 = { on -> SessionPrefs.setStretch16x9(this, on); stretch16x9 = on },
+-                onRefreshCap = { hz -> SessionPrefs.setRefreshCap(this, hz); refreshCap = SessionPrefs.refreshCap(this) },
++                onRefreshCap = { hz ->
++                    SessionPrefs.setRefreshCap(this, hz); refreshCap = SessionPrefs.refreshCap(this)
++                    performanceProfile = com.droiddeck.launcher.core.PerformanceProfiles.current(this)
++                },
++                onPerformanceProfile = { id ->
++                    com.droiddeck.launcher.core.PerformanceProfiles.apply(this, id)
++                    loadModeSettings(mode)
++                    refreshCores()
++                },
+                 onMic = { on ->
+                     SessionPrefs.setMicEnabled(this, on)
+                     mic = on
+@@ -2498,7 +2511,10 @@ class FrontEndActivity : ComponentActivity() {
+                     SessionPrefs.setStorageDiagnosticsEnabled(this, on)
+                     storageDiagnostics = on
+                 },
+-                onFexPreset = { id -> SessionPrefs.setFexPreset(this, id); fexPreset = id },
++                onFexPreset = { id ->
++                    SessionPrefs.setFexPreset(this, id); fexPreset = id
++                    performanceProfile = com.droiddeck.launcher.core.PerformanceProfiles.current(this)
++                },
+                 onForceSsbs = { on -> SessionPrefs.setForceSsbs(this, on); forceSsbs = on },
+                 onSyncBackend = { id ->
+                     SessionPrefs.setSyncBackend(this, id)
+@@ -2726,6 +2742,7 @@ class FrontEndActivity : ComponentActivity() {
+         picturePosition = SessionPrefs.picturePosition(this)
+         stretch16x9 = SessionPrefs.stretch16x9(this)
+         refreshCap = SessionPrefs.refreshCap(this)
++        performanceProfile = com.droiddeck.launcher.core.PerformanceProfiles.current(this)
+         mic = SessionPrefs.micEnabled(this)
+         refreshWifiDiscovery()
+         gameStorage = SessionPrefs.gameStorage(this)
+diff --git a/app/src/main/java/com/droiddeck/launcher/core/CpuCores.kt b/app/src/main/java/com/droiddeck/launcher/core/CpuCores.kt
+index b3dca67..b0e7395 100644
+--- a/app/src/main/java/com/droiddeck/launcher/core/CpuCores.kt
++++ b/app/src/main/java/com/droiddeck/launcher/core/CpuCores.kt
+@@ -26,4 +26,15 @@ object CpuCores {
+         val cores = parse(list)
+         return if (cores.isEmpty() || cores.size >= all.size) "" else format(cores)
+     }
++
++    /** The efficiency cluster ("0,1,2,3" on a Snapdragon 685), or "" when every core has the same top clock. */
++    fun littleCores(): String = littleCores(all.associateWith { maxGhz(it) })
++
++    internal fun littleCores(topGhz: Map<Int, Double?>): String {
++        if (topGhz.size < 2 || topGhz.values.any { it == null || it <= 0.0 }) return ""
++        val clocks = topGhz.mapValues { it.value!! }
++        val slowest = clocks.values.minOrNull() ?: return ""
++        val little = clocks.filterValues { Math.abs(it - slowest) < 0.05 }.keys
++        return if (little.size == clocks.size) "" else format(little)
++    }
+ }
+diff --git a/app/src/main/java/com/droiddeck/launcher/core/PerformanceProfiles.kt b/app/src/main/java/com/droiddeck/launcher/core/PerformanceProfiles.kt
+new file mode 100644
+index 0000000..8d751c6
+--- /dev/null
++++ b/app/src/main/java/com/droiddeck/launcher/core/PerformanceProfiles.kt
+@@ -0,0 +1,140 @@
++package com.droiddeck.launcher.core
++
++import android.content.Context
++import com.droiddeck.launcher.session.SessionPrefs
++import com.droiddeck.launcher.stores.xbox.XboxCloudSettings
++import com.droiddeck.launcher.stores.xbox.XboxNativeVideo
++
++/**
++ * Named sets of settings DroidDeck already has. Choosing a profile writes them once; any of them can still be
++ * changed afterwards, and the profile then shows as custom. Nothing here touches CPU or GPU clocks, thermal
++ * limits or Android's own settings: the session refresh cap, the FEX preset, where the Steam client runs,
++ * performance hints for game threads, Steam's shader pre-caching and downloads, and the Xbox Cloud stream.
++ */
++object PerformanceProfiles {
++    const val BALANCED = "balanced"
++    const val PERFORMANCE = "performance"
++    const val BATTERY = "battery"
++    const val COMPATIBILITY = "compatibility"
++    const val XBOX = "xbox"
++    const val XBOX_CLOUD = "xbox_cloud"
++    const val STEAM = "steam"
++    const val CUSTOM = ""
++
++    val all = listOf(BALANCED, PERFORMANCE, BATTERY, COMPATIBILITY, XBOX, XBOX_CLOUD, STEAM)
++
++    private const val FEX_DEFAULT = "PERFORMANCE_TSO"
++
++    /** Xbox Cloud settings a profile sets; null leaves the current value. */
++    data class Cloud(
++        val playerEngine: String? = null,
++        val resolution: String? = null,
++        val fpsLimit: Int? = null,
++        val bitrateMbps: Int? = null,
++        val frameGen: String? = null,
++        val smallBuffer: Boolean? = null,
++        val fastDecoder: Boolean? = null,
++        val zeroCopy: Boolean? = null,
++    ) {
++        fun applyTo(s: XboxCloudSettings) = s.copy(
++            playerEngine = playerEngine ?: s.playerEngine, resolution = resolution ?: s.resolution,
++            fpsLimit = fpsLimit ?: s.fpsLimit, fpsCustomOn = if (fpsLimit != null) false else s.fpsCustomOn,
++            bitrateMbps = bitrateMbps ?: s.bitrateMbps, frameGen = frameGen ?: s.frameGen,
++            smallBuffer = smallBuffer ?: s.smallBuffer, fastDecoder = fastDecoder ?: s.fastDecoder, zeroCopy = zeroCopy ?: s.zeroCopy,
++        )
++
++        fun holds(s: XboxCloudSettings) = applyTo(s) == s
++    }
++
++    /** What a profile sets; null leaves the current value. clientCores "" means every core (no pinning). */
++    data class Plan(
++        val refreshCap: Int? = null,
++        val fexPreset: String? = null,
++        val clientCores: String? = null,
++        val pinGamescope: Boolean? = null,
++        val gameThreadHints: Boolean? = null,
++        val shaderPrecache: Boolean? = null,
++        val steamDownloadsInBackground: Boolean? = null,
++        val cloud: Cloud? = null,
++    )
++
++    /**
++     * lowTier: LowTierDevice.detected (Adreno 6xx below the 630, e.g. Snapdragon 685). little: CpuCores.littleCores(),
++     * "" on a CPU with one cluster.
++     */
++    fun plan(profile: String, lowTier: Boolean, little: String): Plan {
++        val cap60 = if (lowTier) 60 else 0
++        val noFrameGen = if (lowTier) XboxNativeVideo.FG_OFF else null
++        return when (profile) {
++            // DroidDeck's own defaults for this device.
++            BALANCED -> Plan(refreshCap = SessionPrefs.defaultRefreshCap(lowTier), fexPreset = FEX_DEFAULT, clientCores = "",
++                pinGamescope = true, gameThreadHints = false,
++                cloud = Cloud(resolution = "1080p", fpsLimit = 0, bitrateMbps = 0,
++                    frameGen = if (lowTier) XboxNativeVideo.FG_OFF else XboxNativeVideo.FG_DDFG, smallBuffer = false, fastDecoder = true))
++            // The game gets the fast cores: the Steam client and its web helper (x86-64 under FEX on an ARMv8.0 CPU) move
++            // to the efficiency cluster, gamescope stays free; Android is asked to keep the busiest game threads fed;
++            // no background shader compiling on a low-tier GPU; the stream takes the lowest-latency path.
++            PERFORMANCE -> Plan(refreshCap = cap60, fexPreset = FEX_DEFAULT, clientCores = little, pinGamescope = false,
++                gameThreadHints = true, shaderPrecache = if (lowTier) false else null,
++                cloud = Cloud(fpsLimit = 0, frameGen = noFrameGen, smallBuffer = true, fastDecoder = true, zeroCopy = true))
++            // Half the frames (30 Hz session, an exact divisor of 60 Hz), everything but the game on the efficiency
++            // cluster, no background work, a 720p stream at 8 Mb/s with the screen at 60 Hz.
++            BATTERY -> Plan(refreshCap = 30, fexPreset = FEX_DEFAULT, clientCores = little, pinGamescope = true,
++                gameThreadHints = false, shaderPrecache = false, steamDownloadsInBackground = false,
++                cloud = Cloud(resolution = "720p", fpsLimit = 60, bitrateMbps = 8, frameGen = XboxNativeVideo.FG_OFF,
++                    smallBuffer = false, fastDecoder = true))
++            // FEX keeps x86 memory ordering everywhere (vector and memcpy included) and full x87 precision: slower,
++            // for games that crash or glitch otherwise. The stream uses the web engine with normal buffering.
++            COMPATIBILITY -> Plan(refreshCap = cap60, fexPreset = "COMPATIBILITY", clientCores = "", pinGamescope = true,
++                gameThreadHints = false,
++                cloud = Cloud(playerEngine = "web", frameGen = noFrameGen, smallBuffer = false, fastDecoder = false, zeroCopy = false))
++            // Xbox PC games installed from the Xbox store run locally through Proton: like PERFORMANCE, at a steady
++            // 30 fps on a low-tier GPU, the usual target of these titles on weak hardware.
++            XBOX -> Plan(refreshCap = if (lowTier) 30 else 0, fexPreset = FEX_DEFAULT, clientCores = little, pinGamescope = false,
++                gameThreadHints = true, shaderPrecache = if (lowTier) false else null)
++            // Streaming only: the console renders, this device decodes. Best picture the panel shows, lowest latency.
++            XBOX_CLOUD -> Plan(cloud = Cloud(resolution = "1080p", fpsLimit = 0, bitrateMbps = 0, frameGen = noFrameGen,
++                smallBuffer = true, fastDecoder = true, zeroCopy = true))
++            STEAM -> Plan(refreshCap = cap60, fexPreset = FEX_DEFAULT, clientCores = little, pinGamescope = false,
++                gameThreadHints = true, shaderPrecache = if (lowTier) false else null)
++            else -> Plan()
++        }
++    }
++
++    fun plan(context: Context, profile: String) =
++        plan(profile, LowTierDevice.detected, CpuCores.littleCores())
++
++    fun apply(context: Context, profile: String) {
++        if (profile !in all) return
++        val p = plan(context, profile)
++        p.refreshCap?.let { SessionPrefs.setRefreshCap(context, it) }
++        p.fexPreset?.let { SessionPrefs.setFexPreset(context, it) }
++        p.clientCores?.let {
++            SessionPrefs.setClientCpusOverride(context, it.isNotEmpty())
++            SessionPrefs.setClientCpus(context, it)
++        }
++        p.pinGamescope?.let { SessionPrefs.setPinGamescope(context, it) }
++        p.gameThreadHints?.let { SessionPrefs.setGameThreadHintsEverywhere(context, it) }
++        p.shaderPrecache?.let { SessionPrefs.setShaderPrecache(context, it) }
++        p.steamDownloadsInBackground?.let { SessionPrefs.setSteamDownloadsInBackground(context, it) }
++        p.cloud?.let { XboxCloudSettings.save(context, it.applyTo(XboxCloudSettings.load(context))) }
++        SessionPrefs.setPerformanceProfile(context, profile)
++    }
++
++    /** The chosen profile while every setting it wrote still holds, else CUSTOM. Shader pre-caching is not compared:
++     *  Steam can rewrite it. */
++    fun current(context: Context): String {
++        val id = SessionPrefs.performanceProfile(context)
++        if (id !in all) return CUSTOM
++        val p = plan(context, id)
++        val held = (p.refreshCap == null || SessionPrefs.refreshCap(context) == p.refreshCap) &&
++            (p.fexPreset == null || SessionPrefs.fexPreset(context) == p.fexPreset) &&
++            (p.clientCores == null || (if (p.clientCores.isEmpty()) !SessionPrefs.clientCpusOverride(context)
++                else SessionPrefs.clientCpusOverride(context) && SessionPrefs.clientCpus(context) == p.clientCores)) &&
++            (p.pinGamescope == null || SessionPrefs.pinGamescope(context) == p.pinGamescope) &&
++            (p.gameThreadHints == null || SessionPrefs.gameThreadHintsEverywhere(context) == p.gameThreadHints) &&
++            (p.steamDownloadsInBackground == null || SessionPrefs.steamDownloadsInBackground(context) == p.steamDownloadsInBackground) &&
++            (p.cloud == null || p.cloud.holds(XboxCloudSettings.load(context)))
++        return if (held) id else CUSTOM
++    }
++}
+diff --git a/app/src/main/java/com/droiddeck/launcher/session/GameThreadHints.kt b/app/src/main/java/com/droiddeck/launcher/session/GameThreadHints.kt
+index 3c2c509..00f5d33 100644
+--- a/app/src/main/java/com/droiddeck/launcher/session/GameThreadHints.kt
++++ b/app/src/main/java/com/droiddeck/launcher/session/GameThreadHints.kt
+@@ -32,13 +32,17 @@ object GameThreadHints {
+     @Synchronized
+     fun start(context: Context): String {
+         if (!SessionPrefs.gameThreadHints(context)) return "game thread hints: off"
+-        if (Build.VERSION.SDK_INT < 31 || Build.SOC_MODEL != "CQ8725S") return "game thread hints: Odin 3 only"
++        if (Build.VERSION.SDK_INT < 31) return "game thread hints: need Android 12"
++        val tuned = Build.SOC_MODEL == "CQ8725S"
++        if (!tuned && !SessionPrefs.gameThreadHintsEverywhere(context)) return "game thread hints: Odin 3 only"
+         val hm = context.getSystemService(PerformanceHintManager::class.java)
+             ?: return "game thread hints: no PerformanceHintManager"
+         val pm = context.getSystemService(PowerManager::class.java)
++        // Elsewhere hints stop one thermal step earlier: a phone SoC throttles sooner than the Odin 3's fan-cooled one.
++        val spareAt = if (tuned) PowerManager.THERMAL_STATUS_CRITICAL else PowerManager.THERMAL_STATUS_SEVERE
+         worker?.interrupt()
+-        worker = Thread({ run(hm, pm) }, "game-thread-hints").apply { isDaemon = true; start() }
+-        return "game thread hints: watching"
++        worker = Thread({ run(hm, pm, spareAt) }, "game-thread-hints").apply { isDaemon = true; start() }
++        return "game thread hints: watching" + if (tuned) "" else " (profile, until thermal status ${spareAt})"
+     }
+ 
+     @Synchronized
+@@ -47,7 +51,7 @@ object GameThreadHints {
+         worker = null
+     }
+ 
+-    private fun run(hm: PerformanceHintManager, pm: PowerManager) {
++    private fun run(hm: PerformanceHintManager, pm: PowerManager, spareAt: Int) {
+         val scanner = Scanner()
+         var session: PerformanceHintManager.Session? = null
+         var boosted = emptySet<Int>()
+@@ -63,7 +67,7 @@ object GameThreadHints {
+                     val fps = (frames.last() - frames.first()).toDouble() / (frames.size - 1).coerceAtLeast(1)
+                     val paced = frames.size > PACE_WINDOW_S && holdsPace(fps, SessionState.refreshHz.toDouble())
+                     pacedFor = if (paced) pacedFor + 1 else 0
+-                    val spare = pm.isPowerSaveMode || pm.currentThermalStatus >= PowerManager.THERMAL_STATUS_CRITICAL
++                    val spare = pm.isPowerSaveMode || pm.currentThermalStatus >= spareAt
+                     val next = when {
+                         spare || pacedFor >= PACE_LEAVE_S -> emptySet()
+                         paced -> pick(boosted, busy.filterKeys { it in boosted })
+diff --git a/app/src/main/java/com/droiddeck/launcher/session/SessionPrefs.kt b/app/src/main/java/com/droiddeck/launcher/session/SessionPrefs.kt
+index 0ef9549..93a96bc 100644
+--- a/app/src/main/java/com/droiddeck/launcher/session/SessionPrefs.kt
++++ b/app/src/main/java/com/droiddeck/launcher/session/SessionPrefs.kt
+@@ -759,6 +759,27 @@ object SessionPrefs {
+ 
+     fun gameThreadHints(context: Context): Boolean = prefs(context).getBoolean("gameThreadHints", true)
+ 
++    /** Performance hints for the busiest game threads on any SoC, not only the one they were tuned on (set by a profile). */
++    fun gameThreadHintsEverywhere(context: Context): Boolean = prefs(context).getBoolean("gameThreadHintsEverywhere", false)
++
++    fun setGameThreadHintsEverywhere(context: Context, on: Boolean) {
++        prefs(context).edit().putBoolean("gameThreadHintsEverywhere", on).apply()
++    }
++
++    /** Whether pinning the client to its cores also moves gamescope there (the original behaviour). */
++    fun pinGamescope(context: Context): Boolean = prefs(context).getBoolean("pinGamescope", true)
++
++    fun setPinGamescope(context: Context, on: Boolean) {
++        prefs(context).edit().putBoolean("pinGamescope", on).apply()
++    }
++
++    /** The performance profile last chosen (see core/PerformanceProfiles), "" when none was. */
++    fun performanceProfile(context: Context): String = prefs(context).getString("performanceProfile", "").orEmpty()
++
++    fun setPerformanceProfile(context: Context, id: String) {
++        prefs(context).edit().putString("performanceProfile", id).apply()
++    }
++
+     fun prootNoSeccomp(context: Context): Boolean = prefs(context).getBoolean("prootNoSeccomp", false)
+ 
+     fun setProotNoSeccomp(context: Context, on: Boolean) {
+diff --git a/app/src/main/java/com/droiddeck/launcher/session/SessionService.kt b/app/src/main/java/com/droiddeck/launcher/session/SessionService.kt
+index 5fb5e37..f961405 100644
+--- a/app/src/main/java/com/droiddeck/launcher/session/SessionService.kt
++++ b/app/src/main/java/com/droiddeck/launcher/session/SessionService.kt
+@@ -974,6 +974,7 @@ class SessionService : Service() {
+         val clientPinned = steamHere && SessionPrefs.clientCpusOverride(this)
+         if (clientPinned) {
+             guest.add("BL_CLIENT_CPUS=" + CpuCores.listOrAll(SessionPrefs.clientCpus(this)))
++            if (!SessionPrefs.pinGamescope(this)) guest.add("BL_CLIENT_PIN_GAMESCOPE=0")
+         }
+         CpuCores.gameLaunchList(SessionPrefs.gameCpus(this), clientPinned)
+             .takeIf { it.isNotEmpty() }?.let { guest.add("BL_GAME_CPUS=$it") }
+diff --git a/app/src/main/java/com/droiddeck/launcher/session/SettingsReset.kt b/app/src/main/java/com/droiddeck/launcher/session/SettingsReset.kt
+index 3d70723..cb2b43e 100644
+--- a/app/src/main/java/com/droiddeck/launcher/session/SettingsReset.kt
++++ b/app/src/main/java/com/droiddeck/launcher/session/SettingsReset.kt
+@@ -22,6 +22,7 @@ object SettingsReset {
+         "gpuDriverMode", "androidDriver", "linuxDriver", "linuxDriver.steam", "linuxDriver.desktop",
+         "tuSysmem", "glThread", "noGlError", "zinkLazy", "mangoapp", "gpuClockPin", "gamescopeRealtime", "ramCapMb", "vramCapMb", "zramClient",
+         "directAudio", "mic", "wifiDiscovery", "clientCpusOverride", "clientCpus", "gameCpus", "refreshCap",
++        "performanceProfile", "pinGamescope", "gameThreadHintsEverywhere",
+         "noXalia", "fastSync", "fsyncFirst", "syncFallback", "prootNoSeccomp", "prootFastPath", "cursorComposite",
+         "guestHostname", "fexPreset", "forceSsbs", "logs", "gameDebugLogsEnabled", "enhancedDiagnosticsNext", "storageDiagnostics",
+         "upscaler", "upscaleSharpness", "screenEffects", "textureAnisotropy", "textureLodBias",
+diff --git a/app/src/main/java/com/droiddeck/launcher/stores/xbox/XboxCloudPlayerActivity.kt b/app/src/main/java/com/droiddeck/launcher/stores/xbox/XboxCloudPlayerActivity.kt
+index 3548509..effbbb1 100644
+--- a/app/src/main/java/com/droiddeck/launcher/stores/xbox/XboxCloudPlayerActivity.kt
++++ b/app/src/main/java/com/droiddeck/launcher/stores/xbox/XboxCloudPlayerActivity.kt
+@@ -94,6 +94,7 @@ class XboxCloudPlayerActivity : ComponentActivity() {
+ 
+     @SuppressLint("SetJavaScriptEnabled")
+     private fun openPlayer() {
++        applyDisplayRate(settings.fpsTarget)
+         val loader = WebViewAssetLoader.Builder().addPathHandler("/assets/", WebViewAssetLoader.AssetsPathHandler(this)).build()
+         val view = WebView(this)
+         web = view
+@@ -184,6 +185,19 @@ class XboxCloudPlayerActivity : ComponentActivity() {
+         root.addView(box, FrameLayout.LayoutParams(-1, -1))
+     }
+ 
++    /** With a frame-rate limit the screen runs at the lowest mode that shows it (60 Hz rather than 120 for a 60 fps
++     *  stream), as the native player does; without one the system's choice is kept. */
++    private fun applyDisplayRate(target: Int) {
++        if (target <= 0) return
++        @Suppress("DEPRECATION") val display = windowManager.defaultDisplay ?: return
++        val current = display.mode
++        val pick = display.supportedModes
++            .filter { it.physicalWidth == current.physicalWidth && it.physicalHeight == current.physicalHeight && it.refreshRate >= target - 0.5f }
++            .minByOrNull { it.refreshRate } ?: return
++        window.attributes = window.attributes.apply { preferredDisplayModeId = pick.modeId }
++        diag("cloud player: display mode ${pick.refreshRate.toInt()} Hz for $target fps")
++    }
++
+     private val rehideBars = Runnable { if (window.decorView.hasWindowFocus()) hideBars() }
+ 
+     private fun watchBars() {
+diff --git a/app/src/main/java/com/droiddeck/launcher/ui/ModeSettingsDialog.kt b/app/src/main/java/com/droiddeck/launcher/ui/ModeSettingsDialog.kt
+index f16d691..aed7a22 100644
+--- a/app/src/main/java/com/droiddeck/launcher/ui/ModeSettingsDialog.kt
++++ b/app/src/main/java/com/droiddeck/launcher/ui/ModeSettingsDialog.kt
+@@ -84,6 +84,7 @@ class ModeSettings(
+     val picturePosition: String? = null,
+     val stretch16x9: Boolean? = null,
+     val refreshCap: Int? = null,
++    val performanceProfile: String? = null,
+     val steamClientArch: String? = null,
+     val returnAfterGame: Boolean? = null,
+     val shaderPrecache: Boolean? = null,
+@@ -140,6 +141,7 @@ class ModeSettingsActions(
+     val onPicturePosition: (String) -> Unit = {},
+     val onStretch16x9: (Boolean) -> Unit = {},
+     val onRefreshCap: (Int) -> Unit = {},
++    val onPerformanceProfile: (String) -> Unit = {},
+     val onSteamRepair: () -> Unit = {},
+     val onSteamClientArch: (String) -> Unit = {},
+     val onMangoapp: (Boolean) -> Unit = {},
+@@ -220,6 +222,15 @@ fun ModeSheetRows(s: ModeSettings, a: ModeSettingsActions, tab: String, extras:
+             if (portraitWindow) shortSide else longSide, if (portraitWindow) longSide else shortSide)
+         val portrait = portraitWindow && !controlsBelow
+         val displaySize = com.droiddeck.launcher.session.SessionDisplay.resolveChoice(s.panelSize, s.resolution, portrait)
++        s.performanceProfile?.let { profile ->
++            SettingsGroup(stringResource(R.string.profile_group)) {
++                val custom = profile == com.droiddeck.launcher.core.PerformanceProfiles.CUSTOM
++                ChoiceRow(host, "performance-profile", stringResource(R.string.profile_label), stringResource(profileHint(profile)),
++                    (if (custom) listOf(profile to stringResource(R.string.profile_custom)) else emptyList()) +
++                        com.droiddeck.launcher.core.PerformanceProfiles.all.map { it to stringResource(profileName(it)) },
++                    profile, stacked = true, onPick = { if (it != com.droiddeck.launcher.core.PerformanceProfiles.CUSTOM) a.onPerformanceProfile(it) })
++            }
++        }
+         SettingsGroup(stringResource(R.string.display_session)) {
+             ResolutionRow(host, s.resolution, s.panelSize, a.onResolution, portrait = portrait)
+             s.picturePosition?.let { position ->
+@@ -243,8 +254,9 @@ fun ModeSheetRows(s: ModeSettings, a: ModeSettingsActions, tab: String, extras:
+             s.refreshCap?.let { cap ->
+                 ChoiceRow(host, "refresh-cap", stringResource(R.string.display_refresh_cap),
+                     stringResource(R.string.display_refresh_cap_hint),
+-                    listOf(0 to stringResource(R.string.display_refresh_cap_panel), 60 to stringResource(R.string.display_refresh_cap_60)),
+-                    if (cap in 1..60) 60 else 0, onPick = a.onRefreshCap)
++                    listOf(0 to stringResource(R.string.display_refresh_cap_panel), 60 to stringResource(R.string.display_refresh_cap_60),
++                        30 to stringResource(R.string.display_refresh_cap_30)),
++                    when (cap) { in 1..30 -> 30; in 31..60 -> 60; else -> 0 }, onPick = a.onRefreshCap)
+             }
+         }
+         SettingsGroup(stringResource(R.string.display_image_scaling)) {
+@@ -759,3 +771,25 @@ internal fun CustomFollowScaleDialog(initial: Float?, onSave: (Float) -> Unit, o
+         dismissButton = { androidx.compose.material3.TextButton(onClick = onDismiss, modifier = Modifier.focusGlide(CircleShape)) { Text(stringResource(R.string.common_cancel)) } },
+     )
+ }
++
++internal fun profileName(id: String): Int = when (id) {
++    com.droiddeck.launcher.core.PerformanceProfiles.BALANCED -> R.string.profile_balanced
++    com.droiddeck.launcher.core.PerformanceProfiles.PERFORMANCE -> R.string.profile_performance
++    com.droiddeck.launcher.core.PerformanceProfiles.BATTERY -> R.string.profile_battery
++    com.droiddeck.launcher.core.PerformanceProfiles.COMPATIBILITY -> R.string.profile_compatibility
++    com.droiddeck.launcher.core.PerformanceProfiles.XBOX -> R.string.profile_xbox
++    com.droiddeck.launcher.core.PerformanceProfiles.XBOX_CLOUD -> R.string.profile_xbox_cloud
++    com.droiddeck.launcher.core.PerformanceProfiles.STEAM -> R.string.profile_steam
++    else -> R.string.profile_custom
++}
++
++internal fun profileHint(id: String): Int = when (id) {
++    com.droiddeck.launcher.core.PerformanceProfiles.BALANCED -> R.string.profile_balanced_hint
++    com.droiddeck.launcher.core.PerformanceProfiles.PERFORMANCE -> R.string.profile_performance_hint
++    com.droiddeck.launcher.core.PerformanceProfiles.BATTERY -> R.string.profile_battery_hint
++    com.droiddeck.launcher.core.PerformanceProfiles.COMPATIBILITY -> R.string.profile_compatibility_hint
++    com.droiddeck.launcher.core.PerformanceProfiles.XBOX -> R.string.profile_xbox_hint
++    com.droiddeck.launcher.core.PerformanceProfiles.XBOX_CLOUD -> R.string.profile_xbox_cloud_hint
++    com.droiddeck.launcher.core.PerformanceProfiles.STEAM -> R.string.profile_steam_hint
++    else -> R.string.profile_custom_hint
++}
+diff --git a/app/src/main/res/values-b+es+419/strings.xml b/app/src/main/res/values-b+es+419/strings.xml
+index f445d2f..825f070 100644
+--- a/app/src/main/res/values-b+es+419/strings.xml
++++ b/app/src/main/res/values-b+es+419/strings.xml
+@@ -2236,6 +2236,25 @@
+     <string name="display_refresh_cap_hint">60 Hz reduce a la mitad el trabajo de dibujo del compositor y de la interfaz de Steam, y el calor que conlleva. Se aplica en la próxima sesión.</string>
+     <string name="display_refresh_cap_panel">Máximo del panel</string>
+     <string name="display_refresh_cap_60">60 Hz</string>
++    <string name="display_refresh_cap_30">30 Hz (ahorro)</string>
++    <string name="profile_group">Perfil de rendimiento</string>
++    <string name="profile_label">Perfil</string>
++    <string name="profile_custom">Personalizado</string>
++    <string name="profile_custom_hint">Se cambiaron ajustes a mano. Elige un perfil para volver a fijarlos juntos; no se toca nada más.</string>
++    <string name="profile_balanced">Equilibrado</string>
++    <string name="profile_balanced_hint">Los valores de DroidDeck para este dispositivo: 60 Hz con una GPU de gama baja, el preset estándar de FEX, todos los núcleos compartidos y el stream de Xbox Cloud por defecto.</string>
++    <string name="profile_performance">Rendimiento</string>
++    <string name="profile_performance_hint">El juego se queda con los núcleos rápidos: el cliente de Steam pasa a los núcleos de eficiencia, se pide a Android que mantenga alimentados los hilos más ocupados del juego (se detiene con calor severo), sin compilar shaders en segundo plano con una GPU de gama baja y Xbox Cloud con la menor latencia.</string>
++    <string name="profile_battery">Ahorro</string>
++    <string name="profile_battery_hint">Sesión a 30 Hz (la mitad de fotogramas), cliente y compositor en los núcleos de eficiencia, sin compilar shaders ni descargar en segundo plano, Xbox Cloud a 720p y 8 Mb/s con la pantalla a 60 Hz.</string>
++    <string name="profile_compatibility">Compatibilidad</string>
++    <string name="profile_compatibility_hint">FEX mantiene el orden de memoria x86 en todo y la precisión x87 completa: más lento, para juegos que de otro modo fallan o muestran errores. Xbox Cloud usa el reproductor web con búfer normal.</string>
++    <string name="profile_xbox">Xbox (juegos de PC)</string>
++    <string name="profile_xbox_hint">Para los juegos de Xbox para PC instalados desde la tienda de Xbox, que se ejecutan en este dispositivo con Proton: como Rendimiento, a 30 fps estables con una GPU de gama baja. No es para la nube.</string>
++    <string name="profile_xbox_cloud">Xbox Cloud</string>
++    <string name="profile_xbox_cloud_hint">Solo cambian los ajustes del stream: 1080p, sin generación de fotogramas con una GPU de gama baja, búfer pequeño, decodificador rápido y vídeo sin copias en el reproductor nativo. El juego se ejecuta en los servidores de Microsoft.</string>
++    <string name="profile_steam">Steam</string>
++    <string name="profile_steam_hint">Para juegos de Steam: 60 Hz con una GPU de gama baja, el cliente de Steam en los núcleos de eficiencia para que el juego conserve los rápidos, pistas de hilos activadas y sin compilar shaders en segundo plano con una GPU de gama baja.</string>
+     <string name="display_game_fit_hint">Cómo se ajustan los juegos 16:9 a esta pantalla. Próxima sesión.</string>
+     <string name="display_game_fit_unavailable">Elige Igual a la pantalla o un tamaño personalizado más estrecho que 16:9.</string>
+     <string name="display_preserve">Mantener proporciones</string>
+diff --git a/app/src/main/res/values-es/strings.xml b/app/src/main/res/values-es/strings.xml
+index 392b2d4..64e90df 100644
+--- a/app/src/main/res/values-es/strings.xml
++++ b/app/src/main/res/values-es/strings.xml
+@@ -2191,6 +2191,25 @@
+     <string name="display_refresh_cap_hint">60 Hz reduce a la mitad el trabajo de dibujo del compositor y de la interfaz de Steam, y el calor que conlleva. Se aplica en la próxima sesión.</string>
+     <string name="display_refresh_cap_panel">Máximo del panel</string>
+     <string name="display_refresh_cap_60">60 Hz</string>
++    <string name="display_refresh_cap_30">30 Hz (ahorro)</string>
++    <string name="profile_group">Perfil de rendimiento</string>
++    <string name="profile_label">Perfil</string>
++    <string name="profile_custom">Personalizado</string>
++    <string name="profile_custom_hint">Se cambiaron ajustes a mano. Elige un perfil para volver a fijarlos juntos; no se toca nada más.</string>
++    <string name="profile_balanced">Equilibrado</string>
++    <string name="profile_balanced_hint">Los valores de DroidDeck para este dispositivo: 60 Hz con una GPU de gama baja, el preset estándar de FEX, todos los núcleos compartidos y el stream de Xbox Cloud por defecto.</string>
++    <string name="profile_performance">Rendimiento</string>
++    <string name="profile_performance_hint">El juego se queda con los núcleos rápidos: el cliente de Steam pasa a los núcleos de eficiencia, se pide a Android que mantenga alimentados los hilos más ocupados del juego (se detiene con calor severo), sin compilar shaders en segundo plano con una GPU de gama baja y Xbox Cloud con la menor latencia.</string>
++    <string name="profile_battery">Ahorro</string>
++    <string name="profile_battery_hint">Sesión a 30 Hz (la mitad de fotogramas), cliente y compositor en los núcleos de eficiencia, sin compilar shaders ni descargar en segundo plano, Xbox Cloud a 720p y 8 Mb/s con la pantalla a 60 Hz.</string>
++    <string name="profile_compatibility">Compatibilidad</string>
++    <string name="profile_compatibility_hint">FEX mantiene el orden de memoria x86 en todo y la precisión x87 completa: más lento, para juegos que de otro modo fallan o muestran errores. Xbox Cloud usa el reproductor web con búfer normal.</string>
++    <string name="profile_xbox">Xbox (juegos de PC)</string>
++    <string name="profile_xbox_hint">Para los juegos de Xbox para PC instalados desde la tienda de Xbox, que se ejecutan en este dispositivo con Proton: como Rendimiento, a 30 fps estables con una GPU de gama baja. No es para la nube.</string>
++    <string name="profile_xbox_cloud">Xbox Cloud</string>
++    <string name="profile_xbox_cloud_hint">Solo cambian los ajustes del stream: 1080p, sin generación de fotogramas con una GPU de gama baja, búfer pequeño, decodificador rápido y vídeo sin copias en el reproductor nativo. El juego se ejecuta en los servidores de Microsoft.</string>
++    <string name="profile_steam">Steam</string>
++    <string name="profile_steam_hint">Para juegos de Steam: 60 Hz con una GPU de gama baja, el cliente de Steam en los núcleos de eficiencia para que el juego conserve los rápidos, pistas de hilos activadas y sin compilar shaders en segundo plano con una GPU de gama baja.</string>
+     <string name="display_game_fit_hint">Cómo se ajustan los juegos 16:9 a esta pantalla. Próxima sesión.</string>
+     <string name="display_game_fit_unavailable">Elige Igual a la pantalla o un tamaño personalizado más estrecho que 16:9.</string>
+     <string name="display_preserve">Mantener proporciones</string>
+diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
+index 93d94ac..821fcc9 100644
+--- a/app/src/main/res/values/strings.xml
++++ b/app/src/main/res/values/strings.xml
+@@ -2392,6 +2392,25 @@
+     <string name="display_refresh_cap_hint">60 Hz halves the drawing work of the compositor and the Steam interface, and the heat that comes with it. Applies next session.</string>
+     <string name="display_refresh_cap_panel">Panel maximum</string>
+     <string name="display_refresh_cap_60">60 Hz</string>
++    <string name="display_refresh_cap_30">30 Hz (battery)</string>
++    <string name="profile_group">Performance profile</string>
++    <string name="profile_label">Profile</string>
++    <string name="profile_custom">Custom</string>
++    <string name="profile_custom_hint">Settings were changed by hand. Pick a profile to set them together again; nothing else is touched.</string>
++    <string name="profile_balanced">Balanced</string>
++    <string name="profile_balanced_hint">DroidDeck\'s defaults for this device: 60 Hz on a low-tier GPU, the standard FEX preset, every core shared, the default Xbox Cloud stream.</string>
++    <string name="profile_performance">Performance</string>
++    <string name="profile_performance_hint">The game gets the fast cores: the Steam client moves to the efficiency cores, Android is asked to keep the busiest game threads fed (stops at severe heat), no background shader compiling on a low-tier GPU, lowest-latency Xbox Cloud path.</string>
++    <string name="profile_battery">Battery saver</string>
++    <string name="profile_battery_hint">30 Hz session (half the frames), client and compositor on the efficiency cores, no background shader compiling or downloads, Xbox Cloud at 720p and 8 Mb/s with the screen at 60 Hz.</string>
++    <string name="profile_compatibility">Compatibility</string>
++    <string name="profile_compatibility_hint">FEX keeps x86 memory ordering everywhere and full x87 precision: slower, for games that crash or glitch otherwise. Xbox Cloud uses the web player with normal buffering.</string>
++    <string name="profile_xbox">Xbox (PC games)</string>
++    <string name="profile_xbox_hint">For Xbox PC games installed from the Xbox store, which run on this device through Proton: like Performance, at a steady 30 fps on a low-tier GPU. Not for cloud streaming.</string>
++    <string name="profile_xbox_cloud">Xbox Cloud</string>
++    <string name="profile_xbox_cloud_hint">Only streaming settings change: 1080p, no frame generation on a low-tier GPU, small buffer, fast decoder, zero-copy video in the native player. The game runs on Microsoft\'s servers.</string>
++    <string name="profile_steam">Steam</string>
++    <string name="profile_steam_hint">For Steam games: 60 Hz on a low-tier GPU, the Steam client on the efficiency cores so the game keeps the fast ones, thread hints on, no background shader compiling on a low-tier GPU.</string>
+     <string name="display_game_fit_hint">How 16:9 games fit this display. Next session.</string>
+     <string name="display_game_fit_unavailable">Choose Match screen or a custom size that isn\'t 16:9.</string>
+     <string name="display_preserve">Keep proportions</string>
+diff --git a/app/src/test/java/com/droiddeck/launcher/core/PerformanceProfilesTest.kt b/app/src/test/java/com/droiddeck/launcher/core/PerformanceProfilesTest.kt
+new file mode 100644
+index 0000000..8193782
+--- /dev/null
++++ b/app/src/test/java/com/droiddeck/launcher/core/PerformanceProfilesTest.kt
+@@ -0,0 +1,94 @@
++package com.droiddeck.launcher.core
++
++import android.app.Application
++import com.droiddeck.launcher.session.SessionPrefs
++import com.droiddeck.launcher.stores.xbox.XboxCloudSettings
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertNull
++import org.junit.Assert.assertTrue
++import org.junit.Test
++import org.robolectric.RuntimeEnvironment
++
++@org.junit.runner.RunWith(org.robolectric.RobolectricTestRunner::class)
++@org.robolectric.annotation.Config(sdk = [33], application = Application::class)
++class PerformanceProfilesTest {
++    private val sd685 = (0..3).associateWith<Int, Double?> { 1.9 } + (4..7).associateWith { 2.8 }
++
++    @Test fun theEfficiencyClusterIsTheSlowestCores() {
++        assertEquals("0,1,2,3", CpuCores.littleCores(sd685))
++        assertEquals("0,1,2,3,4,5", CpuCores.littleCores((0..5).associateWith<Int, Double?> { 2.0 } + (6..7).associateWith { 2.2 }))
++        assertEquals("", CpuCores.littleCores((0..7).associateWith { 2.4 }))
++        assertEquals("", CpuCores.littleCores(sd685 + (3 to null)))
++        assertEquals("", CpuCores.littleCores(mapOf(0 to 1.8)))
++    }
++
++    @Test fun everyProfileUsesKnownSafeValues() {
++        for (lowTier in listOf(true, false)) for (id in PerformanceProfiles.all) {
++            val p = PerformanceProfiles.plan(id, lowTier, "0,1,2,3")
++            p.refreshCap?.let { assertTrue("$id refresh $it", it in setOf(0, 30, 60)) }
++            p.fexPreset?.let { assertEquals("$id fex", it, FexPreset.byId(it).id) }
++            p.cloud?.resolution?.let { assertTrue(it in setOf("720p", "1080p")) }
++            p.cloud?.bitrateMbps?.let { assertTrue(it in 0..100) }
++        }
++    }
++
++    @Test fun batterySaverHalvesTheFramesAndStreamsAt720p() {
++        val p = PerformanceProfiles.plan(PerformanceProfiles.BATTERY, lowTier = true, little = "0,1,2,3")
++        assertEquals(30, p.refreshCap)
++        assertEquals("0,1,2,3", p.clientCores)
++        assertEquals(false, p.shaderPrecache)
++        assertEquals(false, p.steamDownloadsInBackground)
++        val cloud = p.cloud!!.applyTo(XboxCloudSettings())
++        assertEquals("720p", cloud.resolution)
++        assertEquals(60, cloud.fpsTarget)
++        assertEquals(8, cloud.bitrateMbps)
++        assertEquals("off", cloud.frameGen)
++    }
++
++    @Test fun performanceGivesTheGameTheFastCoresAndKeepsGamescopeFree() {
++        val low = PerformanceProfiles.plan(PerformanceProfiles.PERFORMANCE, lowTier = true, little = "0,1,2,3")
++        assertEquals(60, low.refreshCap)
++        assertEquals("PERFORMANCE_TSO", low.fexPreset)
++        assertEquals("0,1,2,3", low.clientCores)
++        assertEquals(false, low.pinGamescope)
++        assertEquals(true, low.gameThreadHints)
++        assertEquals(false, low.shaderPrecache)
++        val high = PerformanceProfiles.plan(PerformanceProfiles.PERFORMANCE, lowTier = false, little = "")
++        assertEquals(0, high.refreshCap)
++        assertEquals("", high.clientCores)
++        assertNull(high.shaderPrecache)
++    }
++
++    @Test fun compatibilityKeepsX86MemoryOrderingAndTheWebPlayer() {
++        val p = PerformanceProfiles.plan(PerformanceProfiles.COMPATIBILITY, lowTier = true, little = "0,1,2,3")
++        assertEquals("COMPATIBILITY", p.fexPreset)
++        assertEquals("", p.clientCores)
++        assertEquals("web", p.cloud!!.applyTo(XboxCloudSettings(playerEngine = "native")).playerEngine)
++    }
++
++    @Test fun xboxCloudOnlyChangesTheStream() {
++        val p = PerformanceProfiles.plan(PerformanceProfiles.XBOX_CLOUD, lowTier = true, little = "0,1,2,3")
++        assertNull(p.refreshCap); assertNull(p.fexPreset); assertNull(p.clientCores); assertNull(p.gameThreadHints)
++        val cloud = p.cloud!!.applyTo(XboxCloudSettings(fpsCustomOn = true, fpsCustom = 45))
++        assertEquals(0, cloud.fpsTarget)
++        assertEquals("off", cloud.frameGen)
++        assertTrue(cloud.zeroCopy && cloud.smallBuffer && cloud.fastDecoder)
++    }
++
++    @Test fun aChosenProfileReadsBackUntilASettingChanges() {
++        val app = RuntimeEnvironment.getApplication()
++        for (id in PerformanceProfiles.all) {
++            PerformanceProfiles.apply(app, id)
++            assertEquals(id, PerformanceProfiles.current(app))
++        }
++        PerformanceProfiles.apply(app, PerformanceProfiles.BATTERY)
++        assertEquals(30, SessionPrefs.refreshCap(app))
++        assertEquals("720p", XboxCloudSettings.load(app).resolution)
++        SessionPrefs.setRefreshCap(app, 60)
++        assertEquals(PerformanceProfiles.CUSTOM, PerformanceProfiles.current(app))
++        PerformanceProfiles.apply(app, PerformanceProfiles.XBOX_CLOUD)
++        assertEquals(PerformanceProfiles.XBOX_CLOUD, PerformanceProfiles.current(app))
++        XboxCloudSettings.save(app, XboxCloudSettings.load(app).copy(bitrateMbps = 12))
++        assertEquals(PerformanceProfiles.CUSTOM, PerformanceProfiles.current(app))
++    }
++}
+diff --git a/tools/linuxfs/overlay/usr/local/bin/droiddeck-session b/tools/linuxfs/overlay/usr/local/bin/droiddeck-session
+index 36da91a..ee9b139 100755
+--- a/tools/linuxfs/overlay/usr/local/bin/droiddeck-session
++++ b/tools/linuxfs/overlay/usr/local/bin/droiddeck-session
+@@ -1746,7 +1746,7 @@ case $mode in
+           for _d in /proc/[0-9]*; do
+             { IFS= read -r -d '' _c && { IFS= read -r -d '' _c1 || _c1=; }; } < "$_d/cmdline" 2>/dev/null || continue
+             case $_c in FEX|*/FEX|FEXInterpreter|*/FEXInterpreter) _c=$_c1 ;; esac
+-            case $_c in *steamwebhelper*|*steamrtarm64/steam|*steamrt64/steam|*gamescope*) ;; *) continue ;; esac
++            case $_c in *steamwebhelper*|*steamrtarm64/steam|*steamrt64/steam) ;; *gamescope*) [ "${BL_CLIENT_PIN_GAMESCOPE:-1}" = 0 ] && continue ;; *) continue ;; esac
+             _t=("$_d"/task/*)
+             _p=${_d#/proc/}
+             [ "${_bl_pinned[$_p]:-}" = "${#_t[@]}" ] && client_single_core_matches "$BL_CLIENT_CPUS" "${_t[@]}" && continue
+-- 
+2.43.0
+

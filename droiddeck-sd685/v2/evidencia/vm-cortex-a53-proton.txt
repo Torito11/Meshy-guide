@@ -1,0 +1,47 @@
+# VM QEMU system aarch64, -cpu cortex-a53 (sin LSE), Ubuntu 24.04 arm64, kernel 6.8; Proton = DroidDeck-Proton 11-12.8 reescrito (tools/armv80)
+
+## wine directo, prefijo creado por el script proton (sin fsync y con WINEFSYNC=1)
+== wintest32 plain rc=0 47s
+wineserver: using server-side synchronization.
+arch 9 cpus 4
+cmpxchg 5 5
+xchg 9 9
+fp 630.996759
+threads 200000 600000 200000
+heap -524288
+OK
+== wintest64 plain rc=0 45s
+threads 200000 600000 200000
+heap -524288
+OK
+== wintest32 fsync rc=0 44s
+fsync: up and running.
+arch 9 cpus 4
+cmpxchg 5 5
+xchg 9 9
+fp 630.996759
+threads 200000 600000 200000
+heap -524288
+OK
+== wintest64 fsync rc=0 44s
+threads 200000 600000 200000
+heap -524288
+OK
+
+## script proton completo (proton run), pantalla Xvfb 1600x720
+== wintest32 via proton script rc=0 105s
+arch 9 cpus 4
+cmpxchg 5 5
+xchg 9 9
+fp 630.996759
+threads 200000 600000 200000
+heap -524288
+OK
+== wintest64 via proton script rc=0 117s
+arch 9 cpus 4
+cmpxchg 5 5
+xchg 9 9
+fp 630.996759
+threads 200000 600000 200000
+heap -524288
+OK

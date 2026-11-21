@@ -1,0 +1,48 @@
+From 650d3bb0f09f470fa32f3d880fad16a06ba3b576 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 21 Nov 2026 04:06:43 +0000
+Subject: [PATCH 12/12] fix(hints): stop asking for hint sessions a device
+ keeps refusing
+
+With hints now possible on any SoC, a power HAL that refuses sessions for
+the game's threads would be asked again every second, with a stack trace
+each time. After five refusals in a row the watcher stops.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../java/com/droiddeck/launcher/session/GameThreadHints.kt   | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/app/src/main/java/com/droiddeck/launcher/session/GameThreadHints.kt b/app/src/main/java/com/droiddeck/launcher/session/GameThreadHints.kt
+index 00f5d33..36f09a2 100644
+--- a/app/src/main/java/com/droiddeck/launcher/session/GameThreadHints.kt
++++ b/app/src/main/java/com/droiddeck/launcher/session/GameThreadHints.kt
+@@ -20,6 +20,7 @@ object GameThreadHints {
+     private const val ENTER = 0.6
+     private const val LEAVE = 0.15
+     private const val MAX_THREADS = 2
++    private const val MAX_REFUSED = 5
+     private const val TOP_PROCESSES = 3
+     private const val PACE_WINDOW_S = 3
+     private const val PACE_LEAVE_S = 10
+@@ -58,6 +59,7 @@ object GameThreadHints {
+         val frames = ArrayDeque<Long>()
+         var pacedFor = 0
+         var tick = 0
++        var refused = 0
+         try {
+             while (!Thread.currentThread().isInterrupted) {
+                 if (tick++ % SCAN_EVERY == 0) {
+@@ -79,6 +81,9 @@ object GameThreadHints {
+                         Log.i(TAG, (if (session == null && next.isNotEmpty()) "no session for " else "boosting ") +
+                             next.joinToString { "${readName("/proc/$it/comm")}/$it ${((busy[it] ?: 0.0) * 100).toInt()}%" }.ifEmpty { "nothing" } +
+                             " (game ${fps.toInt()} fps${if (paced) ", holding pace" else ""})")
++                        refused = if (session == null && next.isNotEmpty()) refused + 1 else 0
++                        // A device whose power HAL refuses hint sessions for these threads would be asked again every second.
++                        if (refused >= MAX_REFUSED) { Log.i(TAG, "hint sessions refused $refused times: stopping"); return }
+                     }
+                 }
+                 session?.reportActualWorkDuration(TARGET_NS * 3 / 2)
+-- 
+2.43.0
+

@@ -1,5 +1,9 @@
 # DroidDeck 0.7.1-sd685 — versión para Redmi Note 13 (Snapdragon 685 / Adreno 610)
 
+> **Nueva versión: [v2 — 0.7.1-sd685.2](v2/README.md).** Proton ARM64 funcionando en tu CPU (reescrito
+> para ARMv8.0), 7 perfiles de rendimiento, sesión a 30 Hz y ajustes de Xbox Cloud. Actualiza la v1 sin
+> borrar datos. Lo que sigue describe la **v1**, que se conserva como copia de seguridad.
+
 Versión modificada de [DroidDeck](https://github.com/Droid-Deck/DroidDeck) 0.7.1 (GPL-3.0) que corrige el
 cierre de Steam con **error 132** en CPUs ARMv8.0 y añade un perfil para hardware de gama baja.
 

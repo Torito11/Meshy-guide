@@ -1,0 +1,857 @@
+From 03db9f6b17264084b7b423245a0727e8463f025f Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 21 Nov 2026 02:58:48 +0000
+Subject: [PATCH 09/12] tools(armv80): rewrite LSE atomics of AArch64 ELF/PE
+ binaries for ARMv8.0 CPUs
+
+Each LSE instruction becomes a branch to its own load/store-exclusive stub with the same
+ordering; LDAPR becomes LDAR. ELF gets the stubs in a PT_LOAD made from a PT_NOTE entry, or
+in a new segment carrying a moved program header table; PE gets a new section, and in hybrid
+ARM64EC/ARM64X images only the ARM code-map ranges are touched and the stubs are added to the
+code map. tests/atomics.c covers all 63 forms, CASP, SP bases, flags and contention.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ tools/armv80/a64.py          | 113 +++++++++++++++++
+ tools/armv80/lse_decode.py   |  32 +++++
+ tools/armv80/rewrite.py      | 239 +++++++++++++++++++++++++++++++++++
+ tools/armv80/rewrite_tree.py |  95 ++++++++++++++
+ tools/armv80/stubs.py        | 170 +++++++++++++++++++++++++
+ tools/armv80/tests/atomics.c | 141 +++++++++++++++++++++
+ 6 files changed, 790 insertions(+)
+ create mode 100644 tools/armv80/a64.py
+ create mode 100644 tools/armv80/lse_decode.py
+ create mode 100644 tools/armv80/rewrite.py
+ create mode 100644 tools/armv80/rewrite_tree.py
+ create mode 100644 tools/armv80/stubs.py
+ create mode 100644 tools/armv80/tests/atomics.c
+
+diff --git a/tools/armv80/a64.py b/tools/armv80/a64.py
+new file mode 100644
+index 0000000..6a9a415
+--- /dev/null
++++ b/tools/armv80/a64.py
+@@ -0,0 +1,113 @@
++"""The few AArch64 encodings the LSE rewriter emits (ARMv8.0 only)."""
++
++NE, LO, HI, LT, GT = 1, 3, 8, 11, 12
++ZR = SP = 31
++
++
++def _imm(off, bits):
++    if off % 4:
++        raise ValueError("unaligned branch")
++    v = off >> 2
++    if not -(1 << (bits - 1)) <= v < (1 << (bits - 1)):
++        raise ValueError("branch out of range")
++    return v & ((1 << bits) - 1)
++
++
++def b(off):
++    return 0x14000000 | _imm(off, 26)
++
++
++def bcond(off, cond):
++    return 0x54000000 | (_imm(off, 19) << 5) | cond
++
++
++def cbnz_w(rt, off):
++    return 0x35000000 | (_imm(off, 19) << 5) | rt
++
++
++def ldxr(size, acq, rt, rn):
++    return (size << 30) | 0x085F7C00 | (acq << 15) | (rn << 5) | rt
++
++
++def stxr(size, rel, rs, rt, rn):
++    return (size << 30) | 0x08007C00 | (rel << 15) | (rs << 16) | (rn << 5) | rt
++
++
++def ldxp(sz, acq, rt, rt2, rn):
++    return 0x887F0000 | (sz << 30) | (acq << 15) | (rt2 << 10) | (rn << 5) | rt
++
++
++def stxp(sz, rel, rs, rt, rt2, rn):
++    return 0x88200000 | (sz << 30) | (rs << 16) | (rel << 15) | (rt2 << 10) | (rn << 5) | rt
++
++
++def ldar(size, rt, rn):
++    return (size << 30) | 0x08DFFC00 | (rn << 5) | rt
++
++
++ALU = {"add": 0x0B000000, "sub": 0x4B000000, "and": 0x0A000000, "bic": 0x0A200000,
++       "orr": 0x2A000000, "eor": 0x4A000000, "subs": 0x6B000000}
++
++
++def alu(op, sf, rd, rn, rm):
++    return ALU[op] | (sf << 31) | (rm << 16) | (rn << 5) | rd
++
++
++def mov(sf, rd, rm):
++    return alu("orr", sf, rd, ZR, rm)
++
++
++def cmp(sf, rn, rm):
++    return alu("subs", sf, ZR, rn, rm)
++
++
++UXTB, UXTH, SXTB, SXTH = 0, 1, 4, 5
++
++
++def cmp_ext_w(rn, rm, option):
++    return 0x6B200000 | (rm << 16) | (option << 13) | (rn << 5) | ZR
++
++
++def csel(sf, rd, rn, rm, cond):
++    return 0x1A800000 | (sf << 31) | (rm << 16) | (cond << 12) | (rn << 5) | rd
++
++
++def sxt_w(size, rd, rn):
++    return (0x13001C00 if size == 0 else 0x13003C00) | (rn << 5) | rd
++
++
++CLREX = 0xD5033F5F
++
++
++def mrs_nzcv(rt):
++    return 0xD53B4200 | rt
++
++
++def msr_nzcv(rt):
++    return 0xD51B4200 | rt
++
++
++def add_sp_imm(rd, imm):
++    return 0x91000000 | (imm << 10) | (SP << 5) | rd
++
++
++def _imm7(off):
++    if off % 8 or not -512 <= off < 512:
++        raise ValueError("bad pair offset")
++    return (off // 8) & 0x7F
++
++
++def stp_pre(rt, rt2, off):
++    return 0xA9800000 | (_imm7(off) << 15) | (rt2 << 10) | (SP << 5) | rt
++
++
++def stp(rt, rt2, off):
++    return 0xA9000000 | (_imm7(off) << 15) | (rt2 << 10) | (SP << 5) | rt
++
++
++def ldp(rt, rt2, off):
++    return 0xA9400000 | (_imm7(off) << 15) | (rt2 << 10) | (SP << 5) | rt
++
++
++def ldp_post(rt, rt2, off):
++    return 0xA8C00000 | (_imm7(off) << 15) | (rt2 << 10) | (SP << 5) | rt
+diff --git a/tools/armv80/lse_decode.py b/tools/armv80/lse_decode.py
+new file mode 100644
+index 0000000..0e84c44
+--- /dev/null
++++ b/tools/armv80/lse_decode.py
+@@ -0,0 +1,32 @@
++"""Decoding of the AArch64 instructions an ARMv8.0 core (Cortex-A53/A73) cannot execute but compilers
++emit for -march=armv8.1-a and later: the LSE atomics (CAS, CASP, LD<op>, ST<op>, SWP) and LDAPR."""
++
++OPS = ("add", "clr", "eor", "set", "smax", "smin", "umax", "umin")
++
++
++def decode(w):
++    """A dict describing the instruction word `w`, or None when an ARMv8.0 core can execute it."""
++    # CAS{A}{L}{B,H}: size 001000 1 L 1 Rs o0 11111 Rn Rt
++    if (w & 0x3FA07C00) == 0x08A07C00:
++        return {"kind": "cas", "size": w >> 30, "acq": (w >> 22) & 1, "rel": (w >> 15) & 1,
++                "rs": (w >> 16) & 31, "rt": w & 31, "rn": (w >> 5) & 31}
++    # CASP{A}{L}: 0 sz 001000 0 L 1 Rs o0 11111 Rn Rt
++    if (w & 0xBFA07C00) == 0x08207C00 and not (w >> 16) & 1 and not w & 1:
++        return {"kind": "casp", "size": 2 + ((w >> 30) & 1), "acq": (w >> 22) & 1, "rel": (w >> 15) & 1,
++                "rs": (w >> 16) & 31, "rt": w & 31, "rn": (w >> 5) & 31}
++    # Atomic memory operations: size 111 0 00 A R 1 Rs o3 opc 00 Rn Rt
++    if (w & 0x3F200C00) == 0x38200000:
++        o3, opc = (w >> 15) & 1, (w >> 12) & 7
++        acq, rel = (w >> 23) & 1, (w >> 22) & 1
++        rs, rt, rn, size = (w >> 16) & 31, w & 31, (w >> 5) & 31, w >> 30
++        if o3 == 0:
++            return {"kind": "ld", "op": OPS[opc], "size": size, "acq": acq, "rel": rel, "rs": rs, "rt": rt, "rn": rn}
++        if opc == 0:
++            return {"kind": "swp", "size": size, "acq": acq, "rel": rel, "rs": rs, "rt": rt, "rn": rn}
++        if opc == 4 and acq == 1 and rel == 0 and rs == 31:
++            return {"kind": "ldapr", "size": size, "rt": rt, "rn": rn}
++    return None
++
++
++def is_lse(w):
++    return decode(w) is not None
+diff --git a/tools/armv80/rewrite.py b/tools/armv80/rewrite.py
+new file mode 100644
+index 0000000..803a676
+--- /dev/null
++++ b/tools/armv80/rewrite.py
+@@ -0,0 +1,239 @@
++#!/usr/bin/env python3
++"""Rewrites the LSE atomics of AArch64 ELF and PE (ARM64, ARM64EC, ARM64X) binaries for ARMv8.0.
++
++Each LSE instruction becomes a branch to its own stub (stubs.py) in a new executable region: a
++PT_LOAD segment made from a PT_NOTE program header for ELF, a new section for PE. LDAPR becomes
++LDAR in place. In hybrid PE images only the ARM64 and ARM64EC ranges of the CHPE code map are
++touched (never x64 code), and the new region is added to the code map with the type of the code
++that branches to it.
++
++    rewrite.py <in> <out>            one file; exit 3 when nothing needed rewriting
++"""
++import struct
++import sys
++
++import numpy as np
++
++import a64
++import stubs
++from lse_decode import decode
++
++ALIGN = 0x10000
++
++
++class Unsupported(Exception):
++    pass
++
++
++def align(v, a):
++    return (v + a - 1) // a * a
++
++
++def scan(buf, start, size):
++    """(file offset, decoded) for every LSE/LDAPR word in buf[start:start+size] (4-aligned start)."""
++    size -= size % 4
++    if size <= 0:
++        return []
++    w = np.frombuffer(bytes(buf[start:start + size]), dtype="<u4")
++    cand = ((w & 0x3FA07C00) == 0x08A07C00) | ((w & 0xBFA07C00) == 0x08207C00) | ((w & 0x3F200C00) == 0x38200000)
++    out = []
++    for i in np.nonzero(cand)[0]:
++        info = decode(int(w[i]))
++        if info:
++            out.append((start + 4 * int(i), info))
++    return out
++
++
++def place(buf, sites, base):
++    """Patches every site (file offset, va, info) in buf and returns the stub code for address base."""
++    blob = bytearray()
++    for off, va, info in sites:
++        if info["kind"] == "ldapr":
++            struct.pack_into("<I", buf, off, a64.ldar(info["size"], info["rt"], info["rn"]))
++            continue
++        stub = base + len(blob)
++        blob += stubs.build(info, va, stub)
++        struct.pack_into("<I", buf, off, a64.b(stub - va))
++    return blob
++
++
++# ---------------------------------------------------------------- ELF
++
++PT_LOAD, PT_NOTE = 1, 4
++
++
++def rewrite_elf(data):
++    if data[4] != 2 or data[5] != 1 or struct.unpack_from("<H", data, 18)[0] != 183:
++        raise Unsupported("not a little-endian ELF64 AArch64 file")
++    phoff, shoff = struct.unpack_from("<QQ", data, 0x20)
++    phentsize, phnum, shentsize, shnum = struct.unpack_from("<HHHH", data, 0x36)
++    ranges = []
++    for i in range(shnum):
++        _, typ, flags, addr, off, size = struct.unpack_from("<IIQQQQ", data, shoff + i * shentsize)
++        if typ == 1 and flags & 4 and size:
++            ranges.append((off, size, addr))
++    buf = bytearray(data)
++    sites = [(off, addr + (off - start), info) for start, size, addr in ranges for off, info in scan(buf, start, size)]
++    if not sites:
++        return None, 0
++    phdrs = [bytearray(data[phoff + i * phentsize: phoff + (i + 1) * phentsize]) for i in range(phnum)]
++    types = [struct.unpack_from("<I", p, 0)[0] for p in phdrs]
++    loads = [i for i, t in enumerate(types) if t == PT_LOAD]
++    end = max(struct.unpack_from("<Q", phdrs[i], 0x10)[0] + struct.unpack_from("<Q", phdrs[i], 0x28)[0] for i in loads)
++    base = align(end, ALIGN)
++    blob = place(buf, sites, base)
++    if not blob:
++        return bytes(buf), len(sites)
++    notes = [i for i, t in enumerate(types) if t == PT_NOTE]
++    if notes:
++        # The stub segment takes over a PT_NOTE entry: the program header table stays where it was.
++        offset = align(len(buf), ALIGN)
++        buf += b"\0" * (offset - len(buf)) + blob
++        ph = phdrs.pop(notes[-1])
++        struct.pack_into("<IIQQQQQQ", ph, 0, PT_LOAD, 5, offset, base, base, len(blob), len(blob), ALIGN)
++        last = max(i for i, p in enumerate(phdrs) if struct.unpack_from("<I", p, 0)[0] == PT_LOAD)
++        phdrs.insert(last + 1, ph)
++        for i, p in enumerate(phdrs):
++            buf[phoff + i * phentsize: phoff + (i + 1) * phentsize] = p
++        return bytes(buf), len(sites)
++    # No PT_NOTE: a new segment holds a copy of the program header table with one more entry, then
++    # the stubs. Its file offset equals its address, so a kernel that derives AT_PHDR from e_phoff
++    # (before Linux 5.18) and one that looks the table up in the segments agree.
++    first = loads[0]
++    if struct.unpack_from("<QQ", phdrs[first], 0x08) != (0, 0):
++        raise Unsupported("first PT_LOAD does not map offset 0 at address 0")
++    table = (phnum + 1) * phentsize
++    seg = align(max(len(data), end), ALIGN)
++    head = align(table, 16)
++    buf2 = bytearray(data)
++    blob = place(buf2, [(o, va, info) for o, va, info in sites], seg + head)
++    ph = bytearray(phentsize)
++    size = head + len(blob)
++    struct.pack_into("<IIQQQQQQ", ph, 0, PT_LOAD, 5, seg, seg, seg, size, size, ALIGN)
++    last = max(i for i, p in enumerate(phdrs) if struct.unpack_from("<I", p, 0)[0] == PT_LOAD)
++    phdrs.insert(last + 1, ph)
++    for p in phdrs:
++        if struct.unpack_from("<I", p, 0)[0] == 6:  # PT_PHDR
++            struct.pack_into("<QQQQQ", p, 0x08, seg, seg, seg, table, table)
++    newtable = b"".join(bytes(p) for p in phdrs)
++    buf2 += b"\0" * (seg - len(buf2)) + newtable + b"\0" * (head - table) + blob
++    struct.pack_into("<Q", buf2, 0x20, seg)
++    struct.pack_into("<H", buf2, 0x38, phnum + 1)
++    return bytes(buf2), len(sites)
++
++
++# ---------------------------------------------------------------- PE
++
++def rewrite_pe(data):
++    pe = struct.unpack_from("<I", data, 0x3C)[0]
++    if data[pe:pe + 4] != b"PE\0\0":
++        raise Unsupported("not a PE file")
++    machine, nsec = struct.unpack_from("<HH", data, pe + 4)
++    optsize = struct.unpack_from("<H", data, pe + 20)[0]
++    opt = pe + 24
++    if struct.unpack_from("<H", data, opt)[0] != 0x20B:
++        return None, 0
++    image_base = struct.unpack_from("<Q", data, opt + 24)[0]
++    sect_align, file_align = struct.unpack_from("<II", data, opt + 32)
++    size_of_headers = struct.unpack_from("<I", data, opt + 60)[0]
++    ndirs = struct.unpack_from("<I", data, opt + 108)[0]
++    dirs = [struct.unpack_from("<II", data, opt + 112 + 8 * i) for i in range(ndirs)]
++    sec_table = opt + optsize
++    sections = []
++    for i in range(nsec):
++        name, vsize, va, rsize, rptr = struct.unpack_from("<8sIIII", data, sec_table + 40 * i)
++        chars = struct.unpack_from("<I", data, sec_table + 40 * i + 36)[0]
++        sections.append((name, vsize, va, rsize, rptr, chars))
++
++    def rva_to_off(rva):
++        for _, vsize, va, rsize, rptr, _ in sections:
++            if va <= rva < va + max(vsize, rsize):
++                return rptr + rva - va
++        raise Unsupported("rva %#x outside the sections" % rva)
++
++    codemap = None
++    meta = 0
++    if ndirs > 10 and dirs[10][0]:
++        lc = rva_to_off(dirs[10][0])
++        lc_size = struct.unpack_from("<I", data, lc)[0]
++        if lc_size >= 0xD0:
++            ptr = struct.unpack_from("<Q", data, lc + 0xC8)[0]
++            if ptr:
++                meta = rva_to_off(ptr - image_base)
++                _, map_rva, count = struct.unpack_from("<III", data, meta)
++                mo = rva_to_off(map_rva)
++                codemap = [struct.unpack_from("<II", data, mo + 8 * i) for i in range(count)]
++    if codemap is not None:
++        arm = [(s & ~3, l, s & 3) for s, l in codemap if s & 3 in (0, 1)]
++    elif machine == 0xAA64:
++        arm = [(va, vsize, 0) for _, vsize, va, _, _, ch in sections if ch & 0x20000000]
++    else:
++        return None, 0
++
++    buf = bytearray(data)
++    sites = []
++    for start, length, typ in arm:
++        for _, vsize, va, rsize, rptr, ch in sections:
++            lo, hi = max(start, va), min(start + length, va + min(vsize, rsize))
++            if lo < hi and ch & 0x20000000:
++                lo4 = align(lo, 4)
++                for off, info in scan(buf, rptr + lo4 - va, hi - lo4):
++                    sites.append((off, va + off - rptr, info, typ))
++    if not sites:
++        return None, 0
++
++    first_raw = min((rptr for _, _, _, rsize, rptr, _ in sections if rsize), default=size_of_headers)
++    if sec_table + 40 * (nsec + 1) > min(size_of_headers, first_raw):
++        raise Unsupported("no room for another section header")
++    new_va = align(max(va + max(vsize, rsize) for _, vsize, va, rsize, _, _ in sections), sect_align)
++    blob = bytearray()
++    new_ranges = []
++    for typ in (0, 1):
++        group = [(o, va, info) for o, va, info, t in sites if t == typ]
++        if not group:
++            continue
++        start = new_va + len(blob)
++        code = place(buf, group, start)
++        if code:
++            blob += code
++            new_ranges.append((start, len(code), typ))
++        blob += b"\0" * (align(len(blob), 16) - len(blob))
++    if not blob:
++        return bytes(buf), len(sites)
++    if codemap is not None:
++        map_rva = new_va + len(blob)
++        entries = sorted([(s, l) for s, l in codemap] + [(s | t, l) for s, l, t in new_ranges], key=lambda e: e[0] & ~3)
++        for s, l in entries:
++            blob += struct.pack("<II", s, l)
++        struct.pack_into("<II", buf, meta + 4, map_rva, len(entries))
++    raw_size = align(len(blob), file_align)
++    raw_ptr = align(len(buf), file_align)
++    buf += b"\0" * (raw_ptr - len(buf)) + blob + b"\0" * (raw_size - len(blob))
++    header = struct.pack("<8sIIIIIIHHI", b".lse80\0\0", len(blob), new_va, raw_size, raw_ptr, 0, 0, 0, 0, 0x60000020)
++    buf[sec_table + 40 * nsec: sec_table + 40 * (nsec + 1)] = header
++    struct.pack_into("<H", buf, pe + 6, nsec + 1)
++    struct.pack_into("<I", buf, opt + 56, align(new_va + len(blob), sect_align))
++    struct.pack_into("<I", buf, opt + 4, struct.unpack_from("<I", buf, opt + 4)[0] + raw_size)
++    return bytes(buf), len(sites)
++
++
++def rewrite(data):
++    if data[:4] == b"\x7fELF":
++        return rewrite_elf(data)
++    if data[:2] == b"MZ":
++        return rewrite_pe(data)
++    return None, 0
++
++
++def main():
++    src, dst = sys.argv[1:3]
++    data = open(src, "rb").read()
++    out, n = rewrite(data)
++    if out is None:
++        sys.exit(3)
++    open(dst, "wb").write(out)
++    print("%s: %d sites" % (src, n))
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/tools/armv80/rewrite_tree.py b/tools/armv80/rewrite_tree.py
+new file mode 100644
+index 0000000..3613b1a
+--- /dev/null
++++ b/tools/armv80/rewrite_tree.py
+@@ -0,0 +1,95 @@
++#!/usr/bin/env python3
++"""Rewrites every AArch64 ELF/PE file of a Proton tree for ARMv8.0 and writes a patch for it.
++
++    rewrite_tree.py <proton dir> <rewritten dir> <patch.lse80>
++
++The rewritten tree is a copy of the original. The patch holds, for each changed file, its path,
++the sha256 of the original and of the result, and the byte runs that differ (apply_patch.py).
++"""
++import hashlib
++import os
++import shutil
++import struct
++import sys
++import time
++import zlib
++
++sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
++import rewrite  # noqa: E402
++
++MAGIC = b"LSE80PATCH1\n"
++
++
++def runs(old, new, gap=8):
++    """(offset, bytes) runs where new differs from old (runs closer than `gap` merged), plus the tail."""
++    import numpy as np
++    n = min(len(old), len(new))
++    a = np.frombuffer(old, dtype=np.uint8, count=n)
++    b = np.frombuffer(new, dtype=np.uint8, count=n)
++    idx = np.nonzero(a != b)[0]
++    out = []
++    if len(idx):
++        breaks = np.nonzero(np.diff(idx) > gap)[0]
++        starts = np.concatenate(([idx[0]], idx[breaks + 1]))
++        ends = np.concatenate((idx[breaks], [idx[-1]])) + 1
++        out = [(int(s), new[int(s):int(e)]) for s, e in zip(starts, ends)]
++    if len(new) > n:
++        if out and out[-1][0] + len(out[-1][1]) >= n - gap:
++            s = out.pop()[0]
++            out.append((s, new[s:]))
++        else:
++            out.append((n, new[n:]))
++    return out
++
++
++def main():
++    src, dst, patch_path = sys.argv[1:4]
++    if os.path.exists(dst):
++        shutil.rmtree(dst)
++    shutil.copytree(src, dst, symlinks=True)
++    entries = []
++    stats = {"files": 0, "sites": 0, "unsupported": []}
++    t0 = time.time()
++    for dp, _, fn in os.walk(dst):
++        for f in sorted(fn):
++            p = os.path.join(dp, f)
++            if os.path.islink(p) or not os.path.isfile(p):
++                continue
++            with open(p, "rb") as fh:
++                head = fh.read(4)
++            if head != b"\x7fELF" and head[:2] != b"MZ":
++                continue
++            data = open(p, "rb").read()
++            try:
++                out, n = rewrite.rewrite(data)
++            except rewrite.Unsupported as e:
++                stats["unsupported"].append((os.path.relpath(p, dst), str(e)))
++                continue
++            except (struct.error, ValueError, IndexError) as e:
++                stats["unsupported"].append((os.path.relpath(p, dst), "unparsable: %s" % e))
++                continue
++            if out is None or out == data:
++                continue
++            mode = os.stat(p).st_mode
++            with open(p, "wb") as fh:
++                fh.write(out)
++            os.chmod(p, mode)
++            rel = os.path.relpath(p, dst)
++            entries.append((rel, hashlib.sha256(data).digest(), hashlib.sha256(out).digest(), len(out), runs(data, out)))
++            stats["files"] += 1
++            stats["sites"] += n
++    body = bytearray()
++    for rel, before, after, size, rs in entries:
++        name = rel.encode()
++        body += struct.pack("<H", len(name)) + name + before + after + struct.pack("<QI", size, len(rs))
++        for off, data in rs:
++            body += struct.pack("<QI", off, len(data)) + data
++    with open(patch_path, "wb") as fh:
++        fh.write(MAGIC + struct.pack("<I", len(entries)) + zlib.compress(bytes(body), 9))
++    print("rewrote %d files, %d sites in %.0f s; patch %d bytes" % (stats["files"], stats["sites"], time.time() - t0, os.path.getsize(patch_path)))
++    for rel, why in stats["unsupported"]:
++        print("UNSUPPORTED %s: %s" % (rel, why))
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/tools/armv80/stubs.py b/tools/armv80/stubs.py
+new file mode 100644
+index 0000000..3efb546
+--- /dev/null
++++ b/tools/armv80/stubs.py
+@@ -0,0 +1,170 @@
++"""An out-of-line ARMv8.0 replacement for one LSE instruction.
++
++The instruction at `site` becomes `B stub`; the stub saves the scratch registers it needs on the
++stack (below SP, after moving SP, so a signal cannot clobber them), performs the operation with a
++load/store-exclusive loop of the same acquire/release ordering (what GCC and Clang emit for these
++atomics at -march=armv8-a), restores the scratch registers and NZCV, and branches back to site+4.
++Scratch registers avoid x13, x14, x18, x23, x24 and x28, which ARM64EC code may not use."""
++
++import struct
++
++import a64
++
++POOL = (16, 17, 15, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0, 19, 20, 21, 22, 25, 26, 27)
++COND = {"smax": a64.GT, "smin": a64.LT, "umax": a64.HI, "umin": a64.LO}
++
++
++class Asm:
++    def __init__(self, base):
++        self.base = base
++        self.words = []
++        self.fix = []
++
++    @property
++    def here(self):
++        return self.base + 4 * len(self.words)
++
++    def emit(self, *ws):
++        self.words.extend(ws)
++
++    def label(self):
++        return len(self.words)
++
++    def patch_later(self, fn):
++        self.fix.append((len(self.words), fn))
++        self.words.append(0)
++
++    def slot(self):
++        self.words.append(0)
++        return len(self.words) - 1
++
++    def resolve(self):
++        for index, fn in self.fix:
++            self.words[index] = fn(self.base + 4 * index)
++        return b"".join(struct.pack("<I", w) for w in self.words)
++
++
++def scratch(info, count):
++    used = {info["rs"], info["rt"], info["rn"]}
++    if info["kind"] == "casp":
++        used |= {info["rs"] + 1, info["rt"] + 1}
++    free = [r for r in POOL if r not in used]
++    if len(free) < count:
++        raise ValueError("not enough scratch registers")
++    return free[:count]
++
++
++def build(info, site, stub):
++    """Machine code for the stub at address `stub` replacing the instruction at `site`."""
++    kind, size = info["kind"], info["size"]
++    rs, rt, rn = info["rs"], info["rt"], info["rn"]
++    acq, rel = info["acq"], info["rel"]
++    sf = 1 if size == 3 else 0
++    op = info.get("op")
++    minmax = kind == "ld" and op in COND
++    flags = kind in ("cas", "casp") or minmax
++    signed_small = minmax and op in ("smax", "smin") and size < 2
++
++    need = ["old", "status"]
++    if kind == "casp":
++        need.append("old2")
++    if kind == "ld":
++        need.append("new")
++    if signed_small:
++        need.append("ext")
++    if rn == a64.SP:
++        need.append("addr")
++    if flags:
++        need.append("flags")
++    regs = scratch(info, len(need) + (len(need) & 1))
++    t = dict(zip(need, regs))
++    pairs = [regs[i:i + 2] for i in range(0, len(regs), 2)]
++    frame = 16 * len(pairs)
++
++    a = Asm(stub)
++    a.emit(a64.stp_pre(pairs[0][0], pairs[0][1], -frame))
++    for i, (x, y) in enumerate(pairs[1:], 1):
++        a.emit(a64.stp(x, y, 16 * i))
++    if flags:
++        a.emit(a64.mrs_nzcv(t["flags"]))
++    addr = rn
++    if rn == a64.SP:
++        addr = t["addr"]
++        a.emit(a64.add_sp_imm(addr, frame))
++    old, st = t["old"], t["status"]
++
++    loop = a.label()
++    if kind == "casp":
++        sz = size - 2
++        old2 = t["old2"]
++        a.emit(a64.ldxp(sz, acq, old, old2, addr))
++        a.emit(a64.cmp(sz, old, rs))
++        fail_jumps = [a.slot()]
++        a.emit(a64.cmp(sz, old2, rs + 1))
++        fail_jumps.append(a.slot())
++        a.emit(a64.stxp(sz, rel, st, rt, rt + 1, addr))
++        a.patch_later(lambda pc, l=loop: a64.cbnz_w(st, stub + 4 * l - pc))
++        done_jump = a.slot()
++        fail = a.label()
++        # A failed compare writes the pair back: only a successful store-exclusive makes the
++        # 128-bit read single-copy atomic (as libatomic does).
++        a.emit(a64.stxp(sz, rel, st, old, old2, addr))
++        a.patch_later(lambda pc, l=loop: a64.cbnz_w(st, stub + 4 * l - pc))
++        done = a.label()
++        for j in fail_jumps:
++            a.fix.append((j, lambda pc, f=fail: a64.bcond(stub + 4 * f - pc, a64.NE)))
++        a.fix.append((done_jump, lambda pc, d=done: a64.b(stub + 4 * d - pc)))
++        if rs != a64.ZR:
++            a.emit(a64.mov(sz, rs, old), a64.mov(sz, rs + 1, old2))
++    elif kind == "cas":
++        a.emit(a64.ldxr(size, acq, old, addr))
++        if size < 2:
++            a.emit(a64.cmp_ext_w(old, rs, a64.UXTB if size == 0 else a64.UXTH))
++        else:
++            a.emit(a64.cmp(sf, old, rs))
++        fail_jump = a.slot()
++        a.emit(a64.stxr(size, rel, st, rt, addr))
++        a.patch_later(lambda pc, l=loop: a64.cbnz_w(st, stub + 4 * l - pc))
++        done_jump = a.slot()
++        fail = a.label()
++        a.emit(a64.CLREX)
++        done = a.label()
++        a.fix.append((fail_jump, lambda pc, f=fail: a64.bcond(stub + 4 * f - pc, a64.NE)))
++        a.fix.append((done_jump, lambda pc, d=done: a64.b(stub + 4 * d - pc)))
++        if rs != a64.ZR:
++            a.emit(a64.mov(sf, rs, old))
++    else:
++        a.emit(a64.ldxr(size, acq, old, addr))
++        if kind == "swp":
++            value = rs
++        else:
++            new = t["new"]
++            value = new
++            if op in ("add", "eor"):
++                a.emit(a64.alu(op, sf, new, old, rs))
++            elif op == "set":
++                a.emit(a64.alu("orr", sf, new, old, rs))
++            elif op == "clr":
++                a.emit(a64.alu("bic", sf, new, old, rs))
++            else:
++                cond = COND[op]
++                if size >= 2:
++                    a.emit(a64.cmp(sf, old, rs))
++                elif signed_small:
++                    a.emit(a64.sxt_w(size, t["ext"], old))
++                    a.emit(a64.cmp_ext_w(t["ext"], rs, a64.SXTB if size == 0 else a64.SXTH))
++                else:
++                    a.emit(a64.cmp_ext_w(old, rs, a64.UXTB if size == 0 else a64.UXTH))
++                a.emit(a64.csel(sf, new, old, rs, cond))
++        a.emit(a64.stxr(size, rel, st, value, addr))
++        a.patch_later(lambda pc, l=loop: a64.cbnz_w(st, stub + 4 * l - pc))
++        if rt != a64.ZR:
++            a.emit(a64.mov(sf, rt, old))
++
++    if flags:
++        a.emit(a64.msr_nzcv(t["flags"]))
++    for i, (x, y) in reversed(list(enumerate(pairs[1:], 1))):
++        a.emit(a64.ldp(x, y, 16 * i))
++    a.emit(a64.ldp_post(pairs[0][0], pairs[0][1], frame))
++    a.patch_later(lambda pc: a64.b(site + 4 - pc))
++    return a.resolve()
+diff --git a/tools/armv80/tests/atomics.c b/tools/armv80/tests/atomics.c
+new file mode 100644
+index 0000000..ebbe12f
+--- /dev/null
++++ b/tools/armv80/tests/atomics.c
+@@ -0,0 +1,141 @@
++/* Exercises every LSE form the rewriter must replace. Built with -march=armv8.3-a and no outline
++ * atomics, so each __atomic call below is one LSE (or LDAPR) instruction. Prints a checksum line per
++ * group; the rewritten binary on an ARMv8.0 CPU must print exactly what the original prints on an
++ * LSE CPU. */
++#include <pthread.h>
++#include <stdint.h>
++#include <stdio.h>
++
++#define ORDERS(X) X(__ATOMIC_RELAXED) X(__ATOMIC_ACQUIRE) X(__ATOMIC_RELEASE) X(__ATOMIC_ACQ_REL) X(__ATOMIC_SEQ_CST)
++
++static uint64_t mix;
++static void note(uint64_t v) { mix = mix * 1000003u ^ v; }
++
++#define FETCH_OPS(T, NAME, VALS)                                                         \
++    static void NAME(void) {                                                             \
++        static const T vals[] = VALS;                                                    \
++        for (unsigned i = 0; i < sizeof vals / sizeof vals[0]; i++)                      \
++            for (unsigned j = 0; j < sizeof vals / sizeof vals[0]; j++) {                \
++                volatile T x;                                                            \
++                T s = vals[j];                                                           \
++                x = vals[i]; note(__atomic_fetch_add((T *)&x, s, __ATOMIC_RELAXED)); note(x); \
++                x = vals[i]; note(__atomic_fetch_add((T *)&x, s, __ATOMIC_ACQUIRE)); note(x); \
++                x = vals[i]; note(__atomic_fetch_add((T *)&x, s, __ATOMIC_RELEASE)); note(x); \
++                x = vals[i]; note(__atomic_fetch_add((T *)&x, s, __ATOMIC_SEQ_CST)); note(x); \
++                x = vals[i]; note(__atomic_fetch_sub((T *)&x, s, __ATOMIC_SEQ_CST)); note(x); \
++                x = vals[i]; note(__atomic_fetch_and((T *)&x, s, __ATOMIC_ACQ_REL)); note(x); \
++                x = vals[i]; note(__atomic_fetch_or((T *)&x, s, __ATOMIC_ACQUIRE)); note(x);  \
++                x = vals[i]; note(__atomic_fetch_xor((T *)&x, s, __ATOMIC_RELEASE)); note(x); \
++                x = vals[i]; note(__atomic_exchange_n((T *)&x, s, __ATOMIC_SEQ_CST)); note(x); \
++                x = vals[i]; note(__atomic_exchange_n((T *)&x, s, __ATOMIC_RELAXED)); note(x); \
++                x = vals[i]; __atomic_fetch_add((T *)&x, s, __ATOMIC_RELAXED); note(x);   \
++                x = vals[i]; __atomic_fetch_or((T *)&x, s, __ATOMIC_RELEASE); note(x);    \
++                x = vals[i]; { T e = vals[j];                                            \
++                    note(__atomic_compare_exchange_n((T *)&x, &e, (T)(s + 1), 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)); \
++                    note(e); note(x); }                                                  \
++                x = vals[i]; { T e = vals[i];                                            \
++                    note(__atomic_compare_exchange_n((T *)&x, &e, (T)(s + 1), 0, __ATOMIC_ACQUIRE, __ATOMIC_ACQUIRE)); \
++                    note(e); note(x); }                                                  \
++                x = vals[i]; { T e = vals[i];                                            \
++                    note(__atomic_compare_exchange_n((T *)&x, &e, s, 0, __ATOMIC_RELEASE, __ATOMIC_RELAXED)); \
++                    note(e); note(x); }                                                  \
++                x = vals[i]; { T e = vals[i];                                            \
++                    note(__atomic_compare_exchange_n((T *)&x, &e, s, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED)); \
++                    note(e); note(x); }                                                  \
++                x = vals[i]; note(__atomic_load_n((T *)&x, __ATOMIC_ACQUIRE));          \
++            }                                                                            \
++        printf(#NAME " %016llx\n", (unsigned long long)mix);                             \
++    }
++
++#define V8 {0, 1, 0x7f, 0x80, 0xff, 0x55}
++#define V16 {0, 1, 0x7fff, 0x8000, 0xffff, 0x1234}
++#define V32 {0, 1, 0x7fffffffu, 0x80000000u, 0xffffffffu, 0x12345678u}
++#define V64 {0, 1, 0x7fffffffffffffffull, 0x8000000000000000ull, ~0ull, 0x0123456789abcdefull}
++FETCH_OPS(uint8_t, u8, V8)
++FETCH_OPS(uint16_t, u16, V16)
++FETCH_OPS(uint32_t, u32, V32)
++FETCH_OPS(uint64_t, u64, V64)
++
++/* Signed and unsigned min/max: GCC has no builtin, the LSE forms come from these patterns at -O2
++ * only on some compilers, so they are written with inline assembly for each size and order. */
++#define MINMAX(SUF, REGQ, T, OPS)                                                         \
++    static T SUF(T *p, T v) { T old; __asm__ volatile(OPS " %" REGQ "2, %" REGQ "0, [%1]" : "=&r"(old) : "r"(p), "r"(v) : "memory"); return old; }
++MINMAX(smaxb, "w", uint8_t, "ldsmaxalb") MINMAX(sminb, "w", uint8_t, "ldsminab")
++MINMAX(umaxb, "w", uint8_t, "ldumaxlb") MINMAX(uminb, "w", uint8_t, "lduminb")
++MINMAX(smaxh, "w", uint16_t, "ldsmaxh") MINMAX(sminh, "w", uint16_t, "ldsminalh")
++MINMAX(umaxh, "w", uint16_t, "ldumaxah") MINMAX(uminh, "w", uint16_t, "lduminlh")
++MINMAX(smaxw, "w", uint32_t, "ldsmaxal") MINMAX(sminw, "w", uint32_t, "ldsmin")
++MINMAX(umaxw, "w", uint32_t, "ldumaxa") MINMAX(uminw, "w", uint32_t, "lduminl")
++MINMAX(smaxx, "x", uint64_t, "ldsmaxl") MINMAX(sminx, "x", uint64_t, "ldsmina")
++MINMAX(umaxx, "x", uint64_t, "ldumax") MINMAX(uminx, "x", uint64_t, "lduminal")
++
++static void minmax(void) {
++    static const uint8_t b[] = V8; static const uint16_t h[] = V16;
++    static const uint32_t w[] = V32; static const uint64_t x[] = V64;
++    for (int i = 0; i < 6; i++)
++        for (int j = 0; j < 6; j++) {
++            uint8_t vb; uint16_t vh; uint32_t vw; uint64_t vx;
++#define T1(F, V, A) V = A[i]; note(F(&V, A[j])); note(V);
++            T1(smaxb, vb, b) T1(sminb, vb, b) T1(umaxb, vb, b) T1(uminb, vb, b)
++            T1(smaxh, vh, h) T1(sminh, vh, h) T1(umaxh, vh, h) T1(uminh, vh, h)
++            T1(smaxw, vw, w) T1(sminw, vw, w) T1(umaxw, vw, w) T1(uminw, vw, w)
++            T1(smaxx, vx, x) T1(sminx, vx, x) T1(umaxx, vx, x) T1(uminx, vx, x)
++        }
++    printf("minmax %016llx\n", (unsigned long long)mix);
++}
++
++/* Upper bits of the 32-bit source register must not leak into byte/halfword results. */
++static void dirty_registers(void) {
++    uint8_t v = 0x10; uint64_t r, s = 0xffffffffffffff05ull;
++    __asm__ volatile("ldaddb %w2, %w0, [%1]" : "=&r"(r) : "r"(&v), "r"(s) : "memory"); note(r); note(v);
++    uint16_t h = 0x8000; s = 0xabcd7fffull;
++    __asm__ volatile("ldsmaxh %w2, %w0, [%1]" : "=&r"(r) : "r"(&h), "r"(s) : "memory"); note(r); note(h);
++    __asm__ volatile("casb %w0, %w2, [%1]" : "+r"(s) : "r"(&v), "r"((uint64_t)0x77) : "memory"); note(s); note(v);
++    printf("dirty %016llx\n", (unsigned long long)mix);
++}
++
++/* SP-based addressing, ST<op> forms (result discarded) and flags kept across the atomic. */
++static void stack_and_flags(void) {
++    uint64_t r1, r2;
++    __asm__ volatile(
++        "sub sp, sp, #16\n"
++        "mov x9, #5\n str x9, [sp]\n"
++        "mov x10, #7\n"
++        "cmp x10, #7\n"                /* Z set */
++        "ldaddal x10, x11, [sp]\n"     /* SP base */
++        "cset %0, eq\n"                /* flags must survive */
++        "stadd x10, [sp]\n"
++        "ldr %1, [sp]\n"
++        "add sp, sp, #16\n"
++        : "=&r"(r1), "=&r"(r2) : : "x9", "x10", "x11", "memory", "cc");
++    note(r1); note(r2);
++    unsigned __int128 q = ((unsigned __int128)0x1111 << 64) | 0x2222, e = q, n = ((unsigned __int128)3 << 64) | 4;
++    note(__sync_bool_compare_and_swap(&q, e, n)); note((uint64_t)q); note((uint64_t)(q >> 64));
++    note(__sync_bool_compare_and_swap(&q, e, n)); note((uint64_t)q); note((uint64_t)(q >> 64));
++    note((uint64_t)__sync_val_compare_and_swap(&q, n, e)); note((uint64_t)q);
++    printf("stack %016llx\n", (unsigned long long)mix);
++}
++
++/* Atomicity under contention: four threads, 200000 increments each, plus a CAS spin lock. */
++static uint64_t counter, guarded;
++static uint32_t lock;
++static void *worker(void *arg) {
++    (void)arg;
++    for (int i = 0; i < 200000; i++) {
++        __atomic_fetch_add(&counter, 1, __ATOMIC_RELAXED);
++        uint32_t z = 0;
++        while (!__atomic_compare_exchange_n(&lock, &z, 1, 0, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) z = 0;
++        guarded++;
++        __atomic_store_n(&lock, 0, __ATOMIC_RELEASE);
++    }
++    return 0;
++}
++
++int main(void) {
++    u8(); u16(); u32(); u64(); minmax(); dirty_registers(); stack_and_flags();
++    pthread_t t[4];
++    for (int i = 0; i < 4; i++) pthread_create(&t[i], 0, worker, 0);
++    for (int i = 0; i < 4; i++) pthread_join(t[i], 0);
++    printf("threads %llu %llu\n", (unsigned long long)counter, (unsigned long long)guarded);
++    return 0;
++}
+-- 
+2.43.0
+
