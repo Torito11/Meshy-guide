@@ -1,0 +1,837 @@
+From e53f1a78baf4fd5a016ee7a1a37e87ace3ead317 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 21 Nov 2026 16:43:29 +0000
+Subject: [PATCH 17/21] fix(steam): give the x86-64 client's windows an OpenGL
+ that works here, and stop endless web helper restarts
+
+A Snapdragon 685's logs (0.7.1-sd685.3): Steam's composer in steamwebhelper logged "CreateOutputWindow:
+failed to acquire a gl context", fell back to the system composer, and the client restarted its web helper
+23 times, about every 45 s, with no window ever reaching gamescope. FEX's thunked GL failed underneath
+("failed to create dri3 screen", "failed to load driver: zink"). The CEF GPU process never crashed, so the
+0.7.1-sd685.3 watch had nothing to see, and it had died anyway: under the launcher's set -e its first grep
+that found nothing ended it silently.
+
+- x64_gl_try / x64_gl_mode: before the client starts, x86 glxinfo -B through FEX on the session's display,
+  through the thunks and then with the rootfs's llvmpipe. Only a mode that printed a renderer is used
+  (glxinfo exits 0 on failure too). Kept per FEX build, rootfs and driver variables; nothing is decided or
+  kept when it cannot be checked.
+- x64_first_frame_watch: set +e; counts composer GL failures (webhelper.txt), web helper restarts
+  (steamui_html.txt) and Chromium GPU exits from this start on (a rotated log from its start). On the GPU
+  path one composer failure or two restarts move the client to software OpenGL once per session, only
+  when a software context works; four restarts stop the client instead of looping. Progress lines name
+  the restarts and the OpenGL in use.
+- The repair after two starts without an image no longer downloads the client again when the watch saw
+  an OpenGL cause ("cause opengl"); a requested repair also forgets the OpenGL answer.
+- LoadingState + strings (en, es, es-419): the new steps are explained on the loading screen.
+- Tests run under set -eu with the phone's log lines, a FEX stand-in and an x86 glxinfo stand-in.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../launcher/session/LoadingState.kt          |  14 +-
+ app/src/main/res/values-b+es+419/strings.xml  |   6 +
+ app/src/main/res/values-es/strings.xml        |   6 +
+ app/src/main/res/values/strings.xml           |   6 +
+ .../session/LoadingStepExplainedTest.kt       |  27 ++
+ docs/development/x86-64-steam-client.md       |  20 ++
+ .../overlay/usr/local/bin/droiddeck-steam-x64 | 160 +++++++--
+ tools/tests/test_steam_first_frame_watch.py   | 338 ++++++++++++++++--
+ 8 files changed, 518 insertions(+), 59 deletions(-)
+
+diff --git a/app/src/main/java/com/droiddeck/launcher/session/LoadingState.kt b/app/src/main/java/com/droiddeck/launcher/session/LoadingState.kt
+index b9aedf0..67e1b08 100644
+--- a/app/src/main/java/com/droiddeck/launcher/session/LoadingState.kt
++++ b/app/src/main/java/com/droiddeck/launcher/session/LoadingState.kt
+@@ -167,8 +167,18 @@ class LoadingState(context: Context, private val steam: Boolean = true) {
+                 m.groupValues[3].toIntOrNull()?.let { parts += res.getString(com.droiddeck.launcher.R.string.loadstate_free_memory, it) }
+                 if (m.groupValues[4].isNotEmpty()) parts += res.getString(com.droiddeck.launcher.R.string.loadstate_steam_verifying)
+                 if (m.groupValues[5].isNotEmpty()) parts += res.getString(com.droiddeck.launcher.R.string.loadstate_missing_library, m.groupValues[5])
++                m.groupValues[6].toIntOrNull()?.takeIf { it > 0 }?.let { parts += res.getString(com.droiddeck.launcher.R.string.loadstate_webhelper_restarts, it) }
+                 return parts.joinToString(" · ")
+             }
++            GL_SOFTWARE_RESTART.find(scriptStep)?.let {
++                return res.getString(com.droiddeck.launcher.R.string.loadstate_gl_software_restart, it.groupValues[1].toInt(), it.groupValues[2].toInt())
++            }
++            if (scriptStep.startsWith("steam's menus could not use OpenGL on the GPU and software OpenGL does not work")) {
++                return res.getString(com.droiddeck.launcher.R.string.loadstate_gl_none)
++            }
++            WEBHELPER_LOOP.find(scriptStep)?.let { return res.getString(com.droiddeck.launcher.R.string.loadstate_webhelper_loop, it.groupValues[1].toInt()) }
++            if (scriptStep.startsWith("checking which OpenGL Steam's menus can use")) return res.getString(com.droiddeck.launcher.R.string.loadstate_gl_check)
++            if (scriptStep.startsWith("not downloading the x86-64 Steam client again")) return res.getString(com.droiddeck.launcher.R.string.loadstate_no_redownload)
+             GPU_FAILED.find(scriptStep)?.let { return res.getString(com.droiddeck.launcher.R.string.loadstate_steam_gpu_failed, it.groupValues[1].toInt()) }
+             STALLED_RESTART.find(scriptStep)?.let { return res.getString(com.droiddeck.launcher.R.string.loadstate_steam_stalled_restart, it.groupValues[1].toInt()) }
+             STALLED.find(scriptStep)?.let { return res.getString(com.droiddeck.launcher.R.string.loadstate_steam_stalled, it.groupValues[1].toInt()) }
+@@ -179,7 +189,9 @@ class LoadingState(context: Context, private val steam: Boolean = true) {
+             return null
+         }
+ 
+-        private val BUSY = Regex("""^steam is still starting: (\d+) s, client cpu (\d+)%(?:, (\d+) MB free)?(, updating or verifying)?(?:, missing library (\S+))?""")
++        private val BUSY = Regex("""^steam is still starting: (\d+) s, client cpu (\d+)%(?:, (\d+) MB free)?(, updating or verifying)?(?:, missing library ([^,\s]+))?(?:, web helper restarts (\d+), OpenGL (\w+))?""")
++        private val GL_SOFTWARE_RESTART = Regex("""^steam's menus could not use OpenGL on the GPU \((\d+) refused, (\d+) web helper restarts\): restarting""")
++        private val WEBHELPER_LOOP = Regex("""^steam's menus could not be shown: Steam restarted its web helper (\d+) times""")
+         private val GPU_FAILED = Regex("""^steam's menus failed on the GPU \((\d+) GPU process exits\)""")
+         private val STALLED_RESTART = Regex("""^steam has done nothing for (\d+) s and shows no image: restarting""")
+         private val STALLED = Regex("""^steam has done nothing for (\d+) s and shows no image""")
+diff --git a/app/src/main/res/values-b+es+419/strings.xml b/app/src/main/res/values-b+es+419/strings.xml
+index c43f8b3..630d5f6 100644
+--- a/app/src/main/res/values-b+es+419/strings.xml
++++ b/app/src/main/res/values-b+es+419/strings.xml
+@@ -2092,6 +2092,12 @@
+     <string name="loadstate_steam_gpu_retry">El cliente de Steam se actualizó: se vuelve a probar la GPU para sus menús</string>
+     <string name="loadstate_proton_armv80">Preparando Proton para esta CPU (ARMv8.0). La primera vez descarga 626 MB y tarda unos minutos</string>
+     <string name="loadstate_steam_x64_check">Comprobando el cliente de Steam x86-64 (la primera vez descarga unos 2 GB)</string>
++    <string name="loadstate_gl_check">Comprobando qué OpenGL puede usar el menú de Steam en este dispositivo (solo una vez)</string>
++    <string name="loadstate_gl_software_restart">El menú de Steam no pudo obtener OpenGL en la GPU (%1$d rechazos, %2$d reinicios del ayudante web): reiniciando Steam con OpenGL por software</string>
++    <string name="loadstate_gl_none">El menú de Steam no pudo obtener OpenGL en la GPU y OpenGL por software tampoco funciona aquí. Comparte los registros</string>
++    <string name="loadstate_webhelper_loop">No se pudo mostrar el menú de Steam: reinició su ayudante web %1$d veces. Se detuvo Steam en lugar de reintentarlo sin fin. Comparte los registros</string>
++    <string name="loadstate_webhelper_restarts">ayudante web reiniciado %1$d veces</string>
++    <string name="loadstate_no_redownload">No se vuelve a descargar el cliente de Steam: sus archivos están bien; su menú no pudo obtener OpenGL</string>
+     <string name="pextra_busy">Ya se está instalando una herramienta de compatibilidad</string>
+     <string name="pextra_stop_session">Detén la sesión activa antes de instalar herramientas de compatibilidad</string>
+     <string name="pextra_no_release">No se encontró una versión ARM64 de %1$s</string>
+diff --git a/app/src/main/res/values-es/strings.xml b/app/src/main/res/values-es/strings.xml
+index 3c2cb5f..d683b71 100644
+--- a/app/src/main/res/values-es/strings.xml
++++ b/app/src/main/res/values-es/strings.xml
+@@ -2037,6 +2037,12 @@
+     <string name="loadstate_steam_gpu_retry">El cliente de Steam se actualizó: se vuelve a probar la GPU para sus menús</string>
+     <string name="loadstate_proton_armv80">Preparando Proton para esta CPU (ARMv8.0). La primera vez descarga 626 MB y tarda unos minutos</string>
+     <string name="loadstate_steam_x64_check">Comprobando el cliente de Steam x86-64 (la primera vez descarga unos 2 GB)</string>
++    <string name="loadstate_gl_check">Comprobando qué OpenGL puede usar el menú de Steam en este dispositivo (solo una vez)</string>
++    <string name="loadstate_gl_software_restart">El menú de Steam no pudo obtener OpenGL en la GPU (%1$d rechazos, %2$d reinicios del ayudante web): reiniciando Steam con OpenGL por software</string>
++    <string name="loadstate_gl_none">El menú de Steam no pudo obtener OpenGL en la GPU y OpenGL por software tampoco funciona aquí. Comparte los registros</string>
++    <string name="loadstate_webhelper_loop">No se pudo mostrar el menú de Steam: reinició su ayudante web %1$d veces. Se detuvo Steam en lugar de reintentarlo sin fin. Comparte los registros</string>
++    <string name="loadstate_webhelper_restarts">ayudante web reiniciado %1$d veces</string>
++    <string name="loadstate_no_redownload">No se vuelve a descargar el cliente de Steam: sus archivos están bien; su menú no pudo obtener OpenGL</string>
+ 
+     <string name="pextra_busy">Ya se está instalando una herramienta de compatibilidad</string>
+     <string name="pextra_stop_session">Detén la sesión activa antes de instalar herramientas de compatibilidad</string>
+diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
+index 4bb271c..4cdbda6 100644
+--- a/app/src/main/res/values/strings.xml
++++ b/app/src/main/res/values/strings.xml
+@@ -2219,6 +2219,12 @@
+     <string name="loadstate_steam_gpu_retry">The Steam client was updated: trying the GPU renderer for its menus again</string>
+     <string name="loadstate_proton_armv80">Preparing Proton for this CPU (ARMv8.0). The first time it downloads 626 MB and takes a few minutes</string>
+     <string name="loadstate_steam_x64_check">Checking the x86-64 Steam client (the first run downloads about 2 GB)</string>
++    <string name="loadstate_gl_check">Checking which OpenGL Steam\'s menus can use on this device (only once)</string>
++    <string name="loadstate_gl_software_restart">Steam\'s menus could not get OpenGL on the GPU (%1$d refused, %2$d web helper restarts): starting Steam again with software OpenGL</string>
++    <string name="loadstate_gl_none">Steam\'s menus could not get OpenGL on the GPU, and software OpenGL does not work here either. Share the logs</string>
++    <string name="loadstate_webhelper_loop">Steam\'s menus could not be shown: Steam restarted its web helper %1$d times. Steam was stopped instead of retrying for ever. Share the logs</string>
++    <string name="loadstate_webhelper_restarts">web helper restarted %1$d times</string>
++    <string name="loadstate_no_redownload">The Steam client is not downloaded again: its files are fine; its menus could not get OpenGL</string>
+ 
+     <string name="pextra_busy">A compatibility tool install is already running</string>
+     <string name="pextra_stop_session">Stop the active session before installing compatibility tools</string>
+diff --git a/app/src/test/java/com/droiddeck/launcher/session/LoadingStepExplainedTest.kt b/app/src/test/java/com/droiddeck/launcher/session/LoadingStepExplainedTest.kt
+index 9fec5c1..e77f0d2 100644
+--- a/app/src/test/java/com/droiddeck/launcher/session/LoadingStepExplainedTest.kt
++++ b/app/src/test/java/com/droiddeck/launcher/session/LoadingStepExplainedTest.kt
+@@ -38,6 +38,33 @@ class LoadingStepExplainedTest {
+         assertTrue(LoadingState.explainedStep(res, "checking Proton for this CPU (ARMv8.0; the first time downloads 626 MB)")!!.contains("626 MB"))
+     }
+ 
++    @Test fun webHelperRestartsAndOpenGlAreShownWithProgress() {
++        // 0.7.1-sd685.4 adds the web helper restarts and the OpenGL in use; a library name stops at the comma
++        val text = LoadingState.explainedStep(res,
++            "steam is still starting: 95 s, client cpu 40%, 2100 MB free, missing library libnss3.so, web helper restarts 2, OpenGL gpu")!!
++        assertTrue(text, text.startsWith("Steam is still starting · 1:35 · client CPU 40%"))
++        assertTrue(text, "missing library libnss3.so ·" in text)
++        assertTrue(text, text.endsWith("web helper restarted 2 times"))
++        val quiet = LoadingState.explainedStep(res, "steam is still starting: 30 s, client cpu 12%, web helper restarts 0, OpenGL software")!!
++        assertTrue(quiet, "restarted" !in quiet)
++    }
++
++    @Test fun openGlRecoveryAndTheRestartLimitAreExplained() {
++        assertEquals("Steam's menus could not get OpenGL on the GPU (1 refused, 2 web helper restarts): starting Steam again with software OpenGL",
++            LoadingState.explainedStep(res, "steam's menus could not use OpenGL on the GPU (1 refused, 2 web helper restarts): restarting Steam with software OpenGL"))
++        assertTrue(LoadingState.explainedStep(res,
++            "steam's menus could not use OpenGL on the GPU and software OpenGL does not work here either (Error: couldn't find RGB GLX visual)")!!
++            .contains("software OpenGL does not work here either"))
++        assertTrue(LoadingState.explainedStep(res,
++            "steam's menus could not be shown: Steam restarted its web helper 4 times (OpenGL none, 1 contexts refused); Steam was stopped instead of looping. Share the logs")!!
++            .contains("restarted its web helper 4 times"))
++        assertTrue(LoadingState.explainedStep(res, "checking which OpenGL Steam's menus can use on this device (once, and after a driver or FEX change)")!!
++            .contains("only once"))
++        assertTrue(LoadingState.explainedStep(res,
++            "not downloading the x86-64 Steam client again: it starts, but its menus could not get OpenGL (its files are not the cause)")!!
++            .contains("not downloaded again"))
++    }
++
+     @Test fun otherStepsKeepTheirText() {
+         assertNull(LoadingState.explainedStep(res, "starting the Steam client"))
+         assertNull(LoadingState.explainedStep(res, "x86-64 Steam client ready"))
+diff --git a/docs/development/x86-64-steam-client.md b/docs/development/x86-64-steam-client.md
+index cf25613..5334b1d 100644
+--- a/docs/development/x86-64-steam-client.md
++++ b/docs/development/x86-64-steam-client.md
+@@ -234,6 +234,26 @@ alone would then read as an installed client.
+   web helper's GPU process keeps exiting until Chromium gives up on the GPU (the menus then never appear),
+   one line says so with the exit codes, followed by x86 `glxinfo -B` and `vulkaninfo --summary` through
+   FEX's thunks.
++- **OpenGL for the client's own windows** (`x64_gl_mode`). Steam draws its menus with its own composer
++  inside steamwebhelper (`CCompositorGLThread`), which needs an OpenGL context whatever the CEF flags say.
++  Without one it logs `CreateOutputWindow: failed to acquire a gl context`, falls back to the system composer
++  and the client restarts the helper (`Restart webhelper process`) about every 45 s for ever: a Snapdragon
++  685 (Adreno 610, KGSL) did that 23 times, FEX's thunked GL failing with `failed to create dri3 screen` /
++  `failed to load driver: zink`. So before the client starts, x86 `glxinfo -B` through FEX is run on the
++  session's display, first through the thunks, then with the rootfs's own llvmpipe
++  (`LIBGL_ALWAYS_SOFTWARE=1`); a mode counts only when glxinfo printed a renderer (it exits 0 on failure
++  too). The answer is kept in `~/.droiddeck-x64/.droiddeck-gl-mode`, keyed by the FEX build, the rootfs and
++  the driver variables; `software` starts the client with the x64_env software branch and `-cef-disable-gpu`.
++  Nothing is decided or kept when it cannot be checked (no glxinfo, no display). `BL_X64_GL_PROBE=0` skips it.
++- **First-frame watch** (`x64_first_frame_watch`, until the app writes `~/.bl-first-frame`). It runs with
++  `set +e` (0.7.1-sd685.3's ended silently under the launcher's `set -e`) and counts, from the lines each
++  log had when the client started (or from the start of a log Steam rotated), composer GL failures
++  (`webhelper.txt`), helper restarts (`steamui_html.txt`) and Chromium GPU exits (`console-linux.txt`). On
++  the GPU path, one composer failure or two restarts move the client to software OpenGL once per session,
++  only when a software context works (`.bl-restart-software`, restarted by droiddeck-session). Four restarts
++  (`BL_X64_WATCH_RESTARTS`) stop the client instead of looping. It writes `cause opengl` into
++  `package/droiddeck-unconfirmed`, so the two-starts-without-an-image repair does not download the
++  client's files again for a problem they do not have. A requested repair also forgets the OpenGL answer.
+ 
+ ## DroidDeck direct for Linux games and runtimes
+ 
+diff --git a/tools/linuxfs/overlay/usr/local/bin/droiddeck-steam-x64 b/tools/linuxfs/overlay/usr/local/bin/droiddeck-steam-x64
+index 3282610..f231b23 100755
+--- a/tools/linuxfs/overlay/usr/local/bin/droiddeck-steam-x64
++++ b/tools/linuxfs/overlay/usr/local/bin/droiddeck-steam-x64
+@@ -460,11 +460,17 @@ x64_repair=
+ if [ "${BL_X64_REPAIR:-0}" = 1 ]; then
+   x64_repair=requested
+ elif [ -f "$unconfirmed" ] && ! grep -qx repaired "$unconfirmed" && [ "$(grep -cx start "$unconfirmed")" -ge 2 ]; then
+-  x64_repair="the client was started $(grep -cx start "$unconfirmed") times without showing anything"
++  # The first-frame watch writes "cause opengl" when Steam's own logs showed its menus could not get OpenGL: the
++  # client's files are fine then, and downloading them again (about 700 MB) would change nothing.
++  if grep -qx 'cause opengl' "$unconfirmed"; then
++    step "not downloading the x86-64 Steam client again: it starts, but its menus could not get OpenGL (its files are not the cause)"
++  else
++    x64_repair="the client was started $(grep -cx start "$unconfirmed") times without showing anything"
++  fi
+ fi
+ if [ -n "$x64_repair" ]; then
+   step "repairing the x86-64 Steam client ($x64_repair)"
+-  rm -f "$X64_HOME/.droiddeck-client-ok" "$X64_HOME/.droiddeck-cef-software"
++  rm -f "$X64_HOME/.droiddeck-client-ok" "$X64_HOME/.droiddeck-cef-software" "$X64_HOME/.droiddeck-gl-mode"
+   rm -f "$STEAM_X64/package/droiddeck-installed" "$STEAM_X64/.crash" "$STEAM_X64/steam.pid" \
+     "$STEAM_X64"/package/steam_client_*.installed
+ fi
+@@ -935,12 +941,93 @@ x64_stop_client() {
+ # rendering, remembered for this client build. A client that has stopped doing anything is restarted once the same
+ # way when it was on the GPU renderer, and only reported otherwise. The software choice persists, so nothing here
+ # can restart the client more than once per session.
++# Lines matching $3 in log $1 from line $2 on (0 when there are none; never a failing status). A log that Steam
++# rotated or emptied since (now shorter than that) is read from its start.
++x64_since() {
++  local from=$2
++  [ "$(wc -l 2>/dev/null < "$1" || echo 0)" -lt $((from - 1)) ] && from=1
++  tail -n +"$from" "$1" 2>/dev/null | grep -c -- "$3" || true
++}
++
++# A real OpenGL context through FEX, made the way the client makes one: glxinfo -B makes a context current on the
++# session's X display and prints its renderer. $1 = gpu (FEX's GL/Vulkan thunks into the phone's driver) or software
++# (the x86 rootfs's own Mesa, llvmpipe). Prints what it saw; status 0 only when a context was made.
++x64_gl_try() {
++  local fex=${BL_FEX:-/usr/local/bin/FEX} out rc=0
++  [ -x "$ROOTFS/usr/bin/glxinfo" ] || { echo "no x86 glxinfo in the rootfs: cannot check"; return 2; }
++  [ -n "${DISPLAY:-}" ] || { echo "no X display yet: cannot check"; return 2; }
++  out=$(
++    unset LD_LIBRARY_PATH LD_PRELOAD
++    export FEX_ROOTFS=$ROOTFS
++    if [ "$1" = gpu ]; then
++      printf '{"ThunksDB": {"GL": 1, "Vulkan": 1}}\n' > "$X64_HOME/thunks.json"
++      export FEX_THUNKCONFIG=$X64_HOME/thunks.json
++      unset LIBGL_ALWAYS_SOFTWARE LIBGL_DRI3_DISABLE
++    else
++      unset FEX_THUNKCONFIG GALLIUM_DRIVER MESA_LOADER_DRIVER_OVERRIDE VK_ICD_FILENAMES VK_DRIVER_FILES LIBGL_KOPPER_DRI2 \
++        ZINK_DEBUG ZINK_DESCRIPTORS TU_DEBUG MESA_NO_ERROR mesa_glthread
++      export LIBGL_ALWAYS_SOFTWARE=1 GALLIUM_DRIVER=llvmpipe LIBGL_DRI3_DISABLE=1
++    fi
++    timeout "${BL_X64_GL_PROBE_TIMEOUT:-90}" "$fex" /usr/bin/glxinfo -B 2>&1
++  ) || rc=$?
++  printf '%s\n' "$out" | grep -E "OpenGL renderer string|OpenGL core profile version|direct rendering|rror|failed|unable" | head -8
++  [ "$rc" = 0 ] && printf '%s\n' "$out" | grep -q "OpenGL renderer string"
++}
++
++# The OpenGL the client's windows use, kept per FEX build, x86 rootfs and display driver ($X64_GL_KEY):
++# gpu, software, or none when neither made a context. Line 3 says why.
++x64_gl_record() {
++  printf '%s\n%s\n%s\n%s\n' "${X64_GL_KEY:-?}" "$1" "$2" "$(date -u +%F)" > "$X64_HOME/.droiddeck-gl-mode.tmp" &&
++    mv -f "$X64_HOME/.droiddeck-gl-mode.tmp" "$X64_HOME/.droiddeck-gl-mode"
++}
++
++# Steam draws its menus with its own composer inside steamwebhelper, which needs an OpenGL context: without one it
++# falls back, and the client restarts the helper about every 45 s for ever (a Snapdragon 685's logs: "failed to acquire
++# a gl context" and "Restart webhelper process" 23 times, FEX's thunked GL failing with "failed to create dri3 screen").
++# So before the client starts on a device where this was not checked yet, both ways are tried for real; only the one
++# that made a context is used. Prints the mode; its steps go to stderr.
++x64_gl_mode() {
++  local file=$X64_HOME/.droiddeck-gl-mode mode why gpu_out soft_out
++  if [ "$(head -n1 "$file" 2>/dev/null)" = "${X64_GL_KEY:-?}" ]; then sed -n 2p "$file"; return 0; fi
++  step "checking which OpenGL Steam's menus can use on this device (once, and after a driver or FEX change)" >&2
++  if ! x64_gpu || [ "${BL_X64_CLIENT_SOFTWARE:-0}" = 1 ]; then
++    if soft_out=$(x64_gl_try software); then mode=software why="no GPU thunks here; software: ${soft_out//$'\n'/; }"
++    else mode=none why="no GPU thunks here; software failed: ${soft_out//$'\n'/; }"; fi
++  elif gpu_out=$(x64_gl_try gpu); then
++    mode=gpu why="GPU through FEX's thunks: ${gpu_out//$'\n'/; }"
++  elif [ $? = 2 ]; then
++    mode=gpu why="not checked (${gpu_out//$'\n'/; }); the first-frame watch decides"
++  elif soft_out=$(x64_gl_try software); then
++    mode=software why="GPU through FEX's thunks failed (${gpu_out//$'\n'/; }); software: ${soft_out//$'\n'/; }"
++  else
++    mode=none why="GPU failed (${gpu_out//$'\n'/; }); software failed (${soft_out//$'\n'/; })"
++  fi
++  echo "== x86-64 OpenGL for Steam's menus: $mode ($why)" >&2
++  [ -n "${BL_DEBUG_DIR:-}" ] && printf '%s: %s\n%s\n' "$(date -u +%FT%T)" "$mode" "$why" >> "$BL_DEBUG_DIR/x64-gl-probe.txt" 2>/dev/null
++  [ "$mode" = gpu ] && [ "${why#not checked}" != "$why" ] || x64_gl_record "$mode" "$why"
++  echo "$mode"
++}
++
++# Until the app reports the first frame on screen ($REAL_HOME/.bl-first-frame), say what the client is doing and
++# recover from what can be recognised. It runs beside the client under the launcher's set -eu, so it turns -e off:
++# one failing test (a grep finding nothing) must not end it, as it silently did in 0.7.1-sd685.3.
++#   $2 = the OpenGL the client uses (gpu / software / none).
++# - Steam's composer could not get OpenGL on the GPU path, Chromium gave up on the GPU, or Steam keeps restarting its
++#   helper: software OpenGL, once per session, and only when a software context really works here.
++# - Steam restarted its helper BL_X64_WATCH_RESTARTS (4) times anyway: the client is stopped, with what was seen, rather
++#   than looping for ever.
++# - A client that stopped doing anything is restarted once the same way on the GPU path, and reported otherwise.
+ x64_first_frame_watch() {
+-  local client=$1 mode=$2 frame=$REAL_HOME/.bl-first-frame soft_file=$X64_HOME/.droiddeck-cef-software
+-  local log=$STEAM_X64/logs/console-linux.txt from t0=$SECONDS last=-1 idle=0 pct=0 ticks elapsed exits hz said=0 avail lib busy
++  set +e
++  local client=$1 gl=$2 frame=$REAL_HOME/.bl-first-frame logs=$STEAM_X64/logs
++  local console=$STEAM_X64/logs/console-linux.txt helper=$STEAM_X64/logs/webhelper.txt html=$STEAM_X64/logs/steamui_html.txt
++  local c0 h0 m0 t0=$SECONDS last=-1 idle=0 pct=0 ticks elapsed exits hz said=0 avail lib busy restarts glfail gaveup soft rc
+   local tick=${BL_X64_WATCH_TICK:-5} stall=${BL_X64_WATCH_STALL:-180} least=${BL_X64_WATCH_MIN:-300} every=${BL_X64_WATCH_SAY:-30}
++  local limit=${BL_X64_WATCH_RESTARTS:-4}
+   hz=$(getconf CLK_TCK 2>/dev/null || echo 100)
+-  from=$(( $(wc -l 2>/dev/null < "$log" || echo 0) + 1 ))
++  c0=$(( $(wc -l 2>/dev/null < "$console" || echo 0) + 1 ))
++  h0=$(( $(wc -l 2>/dev/null < "$helper" || echo 0) + 1 ))
++  m0=$(( $(wc -l 2>/dev/null < "$html" || echo 0) + 1 ))
+   while kill -0 "$client" 2>/dev/null; do
+     sleep "$tick"
+     if [ -e "$frame" ]; then
+@@ -949,15 +1036,35 @@ x64_first_frame_watch() {
+       return 0
+     fi
+     elapsed=$((SECONDS - t0))
+-    exits=$(tail -n +"$from" "$log" 2>/dev/null | grep -c "GPU process exited unexpectedly")
+-    if [ "$mode" = gpu ] && { tail -n +"$from" "$log" 2>/dev/null | grep -q "GPU process isn't usable" || [ "${exits:-0}" -ge 3 ]; }; then
+-      printf '%s\n%s\n' "$(x64_client_build)" "the GPU renderer failed ($exits GPU process exits) on $(date -u +%F)" > "$soft_file"
+-      : > "$REAL_HOME/.bl-restart-software"
+-      step "steam's menus failed on the GPU ($exits GPU process exits): restarting Steam with software rendering"
++    exits=$(x64_since "$console" "$c0" "GPU process exited unexpectedly")
++    gaveup=$(x64_since "$console" "$c0" "GPU process isn't usable")
++    glfail=$(x64_since "$helper" "$h0" "failed to acquire a gl context")
++    restarts=$(x64_since "$html" "$m0" "Restart webhelper process")
++    if [ "$gl" = gpu ] && { [ "$glfail" -ge 1 ] || [ "$gaveup" -ge 1 ] || [ "$exits" -ge 3 ] || [ "$restarts" -ge 2 ]; }; then
++      soft=$(x64_gl_try software); rc=$?
++      # rc 2: nothing to check with (no x86 glxinfo); then Steam's next start is the check, and the limit below ends it.
++      [ "$rc" = 2 ] && soft="not checked beforehand (${soft%%$'\n'*})"
++      echo "cause opengl" >> "$STEAM_X64/package/droiddeck-unconfirmed" 2>/dev/null
++      if [ "$rc" = 0 ] || [ "$rc" = 2 ]; then
++        x64_gl_record software "the GPU path failed in Steam ($glfail OpenGL contexts refused, $restarts web helper restarts, $exits GPU process exits); software: ${soft//$'\n'/; }"
++        printf '%s\n%s\n' "$(x64_client_build)" "the GPU path failed on $(date -u +%F)" > "$X64_HOME/.droiddeck-cef-software"
++        : > "$REAL_HOME/.bl-restart-software"
++        step "steam's menus could not use OpenGL on the GPU ($glfail refused, $restarts web helper restarts): restarting Steam with software OpenGL"
++        x64_stop_client "$client"
++        return 0
++      fi
++      x64_gl_record none "the GPU path failed in Steam and a software context failed too: ${soft//$'\n'/; }"
++      step "steam's menus could not use OpenGL on the GPU and software OpenGL does not work here either (${soft%%$'\n'*})"
++      gl=none
++    fi
++    if [ "$restarts" -ge "$limit" ]; then
++      [ "$glfail" -ge 1 ] && echo "cause opengl" >> "$STEAM_X64/package/droiddeck-unconfirmed" 2>/dev/null
++      [ "$gl" = software ] && x64_gl_record none "software OpenGL made a context, but Steam still restarted its web helper $restarts times"
++      step "steam's menus could not be shown: Steam restarted its web helper $restarts times (OpenGL $gl, $glfail contexts refused); Steam was stopped instead of looping. Share the logs"
+       x64_stop_client "$client"
+       return 0
+     fi
+-    lib=$(tail -n +"$from" "$log" 2>/dev/null | grep -o -m1 "error while loading shared libraries: [^:]*" | sed 's/.*: //')
++    lib=$(tail -n +"$c0" "$console" 2>/dev/null | grep -o -m1 "error while loading shared libraries: [^:]*" | sed 's/.*: //')
+     ticks=$(x64_client_ticks)
+     busy=
+     x64_bootstrap_active && busy=1
+@@ -968,8 +1075,8 @@ x64_first_frame_watch() {
+     last=$ticks
+     avail=$(awk '/^MemAvailable:/ { print int($2 / 1024) }' /proc/meminfo 2>/dev/null)
+     if [ "$idle" -ge "$stall" ] && [ "$elapsed" -ge "$least" ]; then
+-      if [ "$mode" = gpu ]; then
+-        printf '%s\n%s\n' "$(x64_client_build)" "the client stopped doing anything on the GPU renderer on $(date -u +%F)" > "$soft_file"
++      if [ "$gl" = gpu ] && soft=$(x64_gl_try software); then
++        x64_gl_record software "the client stopped doing anything on the GPU path; software: ${soft//$'\n'/; }"
+         : > "$REAL_HOME/.bl-restart-software"
+         step "steam has done nothing for $idle s and shows no image: restarting Steam with software rendering"
+         x64_stop_client "$client"
+@@ -980,24 +1087,39 @@ x64_first_frame_watch() {
+       said=$elapsed
+     elif [ $((elapsed - said)) -ge "$every" ]; then
+       said=$elapsed
+-      step "steam is still starting: $elapsed s, client cpu $pct%${avail:+, $avail MB free}${busy:+, updating or verifying}${lib:+, missing library $lib}"
++      step "steam is still starting: $elapsed s, client cpu $pct%${avail:+, $avail MB free}${busy:+, updating or verifying}${lib:+, missing library $lib}, web helper restarts $restarts, OpenGL $gl"
+     fi
+   done
+ }
+ 
+ x64_exec() {
+-  local x64_home=${X64_HOME:-} soft_file= build= watch=report
++  local x64_home=${X64_HOME:-} soft_file= build= gl=gpu
+   if [ -n "$x64_home" ]; then
+     soft_file=$x64_home/.droiddeck-cef-software
+     build=$(x64_client_build || true)
+   fi
++  # Which OpenGL the client's windows can use, checked for real on this device (see x64_gl_mode).
++  X64_GL_KEY="v1 $(stat -c %s-%Y "${BL_FEX:-/usr/local/bin/FEX}" 2>/dev/null || true) $(printf %.16s "${ROOTFS_SHA256:-}") ${VK_ICD_FILENAMES:-} ${MESA_LOADER_DRIVER_OVERRIDE:-} ${GALLIUM_DRIVER:-}"
++  export X64_GL_KEY
++  if [ -n "$x64_home" ] && [ "${BL_X64_GL_PROBE:-1}" != 0 ]; then
++    gl=$(x64_gl_mode || echo gpu)
++    gl=${gl##*$'\n'}
++  fi
++  case $gl in
++    software)
++      export BL_X64_CLIENT_SOFTWARE=1 BL_X64_CEF_GPU=0
++      echo "== x86-64 client: OpenGL on the GPU does not work for it here; Steam's menus use software OpenGL (llvmpipe)" >&2 ;;
++    gpu) ;;
++    *) gl=none
++      echo "== x86-64 client: no OpenGL context was possible on the GPU or in software; trying the GPU path, the first-frame watch stops a loop" >&2 ;;
++  esac
+   if [ -n "$soft_file" ] && [ -f "$soft_file" ]; then
+     if [ -n "$build" ] && [ "$(head -n1 "$soft_file")" = "$build" ]; then
+       export BL_X64_CEF_GPU=0
+       step "steam's menus use software rendering on this device: $(sed -n 2p "$soft_file") (client $build)"
+     else
+       rm -f "$soft_file"
+-      step "the Steam client is now build ${build:-?}: trying the GPU renderer for its menus again"
++      [ "$gl" = software ] || step "the Steam client is now build ${build:-?}: trying the GPU renderer for its menus again"
+     fi
+   fi
+   # The bootstrapper re-checks every client file at each start, slowly under FEX. When this same build reached the
+@@ -1042,11 +1164,9 @@ x64_exec() {
+       grep --line-buffered -oE 'Downloading update \([0-9,]+ of [0-9,]+ KB\)|^[[:space:]]*(\[[^]]+\][[:space:]]*)*(Extracting package|Installing update)\.\.\.[[:space:]]*$' | sed -u 's/,//g' >&2 ) &
+   echo "== x86-64 client: steamrt64 $(x64_manifest_version steamrt64) (the client may update itself)" >&2
+   x64_webhelper_gpu && { x64_gpu_watch >&2 & }
+-  if [ "${BL_WEBHELPER_ARGS:-}" = stock ]; then watch=software
+-  elif [ "${BL_X64_ARM_WEBHELPER:-}" = /usr/local/bin/droiddeck-x64-webhelper ]; then watch=gpu
+-  fi
++  if [ "$gl" = gpu ] && { [ "${BL_X64_CLIENT_SOFTWARE:-0}" = 1 ] || ! x64_gpu; }; then gl=software; fi
+   if [ ! -e "$REAL_HOME/.bl-first-frame" ] && [ "${BL_X64_FIRST_FRAME_WATCH:-1}" != 0 ]; then
+-    x64_first_frame_watch "$$" "$watch" >&2 &
++    x64_first_frame_watch "$$" "$gl" >&2 &
+   fi
+   exec "${BL_FEX:-/usr/local/bin/FEX}" "$STEAM_X64/steamrt64/steam" "$@"
+ }
+diff --git a/tools/tests/test_steam_first_frame_watch.py b/tools/tests/test_steam_first_frame_watch.py
+index a7a9c1f..938d4f8 100644
+--- a/tools/tests/test_steam_first_frame_watch.py
++++ b/tools/tests/test_steam_first_frame_watch.py
+@@ -1,6 +1,11 @@
+-"""droiddeck-steam-x64's first-frame watch: while the x86-64 client starts and nothing is on screen it explains
+-what the client is doing, restarts it once with software rendering when its menu renderer gives up on the GPU or
+-stops doing anything, remembers that per client build, and never restarts more than once per session."""
++"""droiddeck-steam-x64 until Steam's first frame: which OpenGL the x86-64 client's windows get (checked for real with
++x86 glxinfo through FEX, both ways, before trusting either), and the first-frame watch that explains what the client
++is doing, moves it to a verified software OpenGL when Steam's composer cannot get one on the GPU, notices Steam
++restarting its web helper (not only the client dying), stops a client that would loop for ever, and never restarts
++more than once per session.
++
++Everything runs under `set -eu`, as the launcher does: 0.7.1-sd685.3's watch died there silently on its first grep
++that found nothing. The log lines are the ones a Snapdragon 685's Steam wrote (DroidDeck-2026-11-21-01-steam.zip)."""
+ import os
+ from pathlib import Path
+ import subprocess
+@@ -18,82 +23,337 @@ def between(text, start, end):
+     return text[begin:text.index(end, begin)]
+ 
+ 
+-HELPERS = between(X64, 'x64_client_build() {', 'x64_exec() {')
++HELPERS = between(X64, 'x64_gpu() {', 'x64_exec() {')
++EXEC = between(X64, 'x64_exec() {', 'x64_share() {')
++REPAIR = between(X64, 'x64_repair=\nif [ "${BL_X64_REPAIR:-0}" = 1 ]; then', 'if [ -n "$x64_repair" ]; then')
++
++# Steam's composer on the phone (webhelper.txt) and the client restarting its helper (steamui_html.txt).
++GL_FAILED = ('[2026-11-21 10:55:28] CCompositorGLThread::CreateOutputWindow: Creating browser window at: 0,0 size: 1280x800\n'
++             '[2026-11-21 10:55:28] Error: CreateOutputWindow: failed to acquire a gl context\n'
++             '[2026-11-21 10:55:28] SP BPM_uid0: Failed to create output window. Falling back to system composer, previous mode: OpenGL\n')
++RESTART = '[2026-11-21 10:55:32] Restart webhelper process, counter 2\n'
++
++# FEX stand-in: runs the x86 program from the rootfs, or reports how the client would have been started.
++FAKE_FEX = r'''#!/bin/sh
++prog=$1; shift
++case $prog in
++  /usr/bin/glxinfo) exec "$FEX_ROOTFS$prog" "$@" ;;
++esac
++echo "CLIENT $prog $*"
++echo "ENV LIBGL_ALWAYS_SOFTWARE=${LIBGL_ALWAYS_SOFTWARE:-} GALLIUM_DRIVER=${GALLIUM_DRIVER:-} FEX_THUNKCONFIG=${FEX_THUNKCONFIG:-} BL_WEBHELPER_ARGS=${BL_WEBHELPER_ARGS:-}"
++'''
++
++# x86 glxinfo stand-in: the GPU way fails the way the phone's did, unless FAKE_GPU says otherwise; the software way
++# only answers when it really got the software variables and none of the GPU ones.
++FAKE_GLXINFO = r'''#!/bin/sh
++echo x >> "$GLXINFO_CALLS"
++if [ -n "${FEX_THUNKCONFIG:-}" ]; then
++  [ -z "${LIBGL_ALWAYS_SOFTWARE:-}" ] || { echo "software variables in the GPU check"; exit 3; }
++  case ${FAKE_GPU:-fail} in
++    ok) echo "direct rendering: Yes"; echo "OpenGL renderer string: zink Vulkan 1.1(Turnip Adreno (TM) 610 (MESA_TURNIP))"; exit 0 ;;
++    hang) exec sleep 30 ;;
++    fail0) echo "Error: couldn't find RGB GLX visual or fbconfig"; exit 0 ;;   # real glxinfo exits 0 like this
++  esac
++  echo "MESA-LOADER: failed to retrieve device information"
++  echo "glx: failed to create dri3 screen"
++  echo "failed to load driver: zink"
++  echo "Error: couldn't find RGB GLX visual or fbconfig"
++  exit 1
++fi
++[ "${LIBGL_ALWAYS_SOFTWARE:-}" = 1 ] && [ "${GALLIUM_DRIVER:-}" = llvmpipe ] && [ -z "${MESA_LOADER_DRIVER_OVERRIDE:-}" ] &&
++  [ -z "${VK_ICD_FILENAMES:-}" ] || { echo "unexpected environment for the software check"; exit 3; }
++case ${FAKE_SOFT:-ok} in
++  ok) echo "direct rendering: Yes"; echo "OpenGL renderer string: llvmpipe (LLVM 20.1.8, 128 bits)"; exit 0 ;;
++esac
++echo "Error: couldn't find RGB GLX visual or fbconfig"
++exit 1
++'''
+ 
+ 
+-class FirstFrameWatchTest(unittest.TestCase):
++class Launcher(unittest.TestCase):
+     def setUp(self):
+         self.tmp = tempfile.TemporaryDirectory()
+         self.root = Path(self.tmp.name)
+         self.home = self.root / 'home'
+         self.x64 = self.home / '.droiddeck-x64'
+         self.steam = self.x64 / 'Steam'
++        self.rootfs = self.x64 / 'rootfs'
+         (self.steam / 'logs').mkdir(parents=True)
+         (self.steam / 'package').mkdir()
+         (self.steam / 'package/beta').write_text('publicbeta\n')
+-        (self.steam / 'package/steam_client_publicbeta_steamrt64.manifest').write_text('"ubuntu12"\n{\n\t"version"\t\t"1763000000"\n}\n')
++        (self.steam / 'package/steam_client_publicbeta_steamrt64.manifest').write_text('"ubuntu12"\n{\n\t"version"\t\t"1795048523"\n}\n')
++        (self.steam / 'package/droiddeck-unconfirmed').write_text('tracked\nstart\n')
+         self.console = self.steam / 'logs/console-linux.txt'
++        self.helper = self.steam / 'logs/webhelper.txt'
++        self.html = self.steam / 'logs/steamui_html.txt'
+         self.console.write_text('old line\n')
++        (self.rootfs / 'usr/bin').mkdir(parents=True)
++        self.glxinfo = self.rootfs / 'usr/bin/glxinfo'
++        self.glxinfo.write_text(FAKE_GLXINFO)
++        self.glxinfo.chmod(0o755)
++        self.fex = self.root / 'FEX'
++        self.fex.write_text(FAKE_FEX)
++        self.fex.chmod(0o755)
++        self.calls = self.root / 'glxinfo-calls'
++        self.debug = self.root / 'debug'
++        self.debug.mkdir()
+ 
+     def tearDown(self):
+         self.tmp.cleanup()
+ 
++    def bash(self, body, env=None, timeout=60):
++        script = ('set -eu\nstep() { echo "== STEP $*"; }\n' + HELPERS +
++                  # GPU thunks are installed unless a test says otherwise
++                  'x64_gpu() { [ "${BL_X64_SOFTWARE:-0}" != 1 ] && [ "${FAKE_THUNKS:-1}" = 1 ]; }\n' + body)
++        environment = {k: v for k, v in os.environ.items()
++                       if not k.startswith(('LIBGL_', 'GALLIUM_', 'MESA_', 'VK_', 'FEX_', 'BL_', 'ZINK_', 'TU_'))}
++        environment.update(REAL_HOME=str(self.home), X64_HOME=str(self.x64), STEAM_X64=str(self.steam),
++                           ROOTFS=str(self.rootfs), ARM_STEAM=str(self.home / 'arm-steam'), X64_CHANNEL='publicbeta',
++                           BL_FEX=str(self.fex), DISPLAY=':9', GLXINFO_CALLS=str(self.calls), X64_GL_KEY='v1 test',
++                           BL_DEBUG_DIR=str(self.debug), LOG=str(self.root / 'steam-x64.log'))
++        environment.update(env or {})
++        return subprocess.run(['bash', '-c', script], env=environment, capture_output=True, text=True, timeout=timeout)
++
++    def gl_mode_file(self):
++        return (self.x64 / '.droiddeck-gl-mode').read_text().splitlines()
++
++    def probes(self):
++        return len(self.calls.read_text().splitlines()) if self.calls.exists() else 0
++
++
++class GlModeTest(Launcher):
++    def mode(self, env=None):
++        result = self.bash('x64_gl_mode\n', env)
++        self.assertEqual(result.returncode, 0, result.stderr)
++        return result.stdout.strip().splitlines()[-1], result
++
++    def test_a_gpu_context_through_the_thunks_keeps_the_gpu(self):
++        mode, result = self.mode({'FAKE_GPU': 'ok'})
++        self.assertEqual(mode, 'gpu')
++        self.assertIn('Turnip Adreno', result.stderr)
++        self.assertEqual(self.gl_mode_file()[:2], ['v1 test', 'gpu'])
++
++    def test_the_phones_gpu_failure_moves_to_a_verified_software_context(self):
++        mode, result = self.mode()
++        self.assertEqual(mode, 'software')
++        why = self.gl_mode_file()[2]
++        self.assertIn('failed to create dri3 screen', why)
++        self.assertIn('llvmpipe', why)
++        self.assertIn('software', (self.debug / 'x64-gl-probe.txt').read_text())
++
++    def test_a_failure_glxinfo_reports_with_exit_status_0_is_still_a_failure(self):
++        # x86 glxinfo from the phone's rootfs printed "couldn't find RGB GLX visual" and exited 0 (evidence/glxinfo-rootfs.txt)
++        mode, _ = self.mode({'FAKE_GPU': 'fail0'})
++        self.assertEqual(mode, 'software')
++
++    def test_nothing_is_chosen_when_neither_way_makes_a_context(self):
++        mode, _ = self.mode({'FAKE_SOFT': 'fail'})
++        self.assertEqual(mode, 'none')
++        self.assertEqual(self.gl_mode_file()[1], 'none')
++
++    def test_the_answer_is_kept_until_fex_the_rootfs_or_the_driver_change(self):
++        self.mode()
++        before = self.probes()
++        self.assertEqual(self.mode()[0], 'software')
++        self.assertEqual(self.probes(), before)            # cached: no glxinfo this time
++        self.assertEqual(self.mode({'X64_GL_KEY': 'v1 other driver', 'FAKE_GPU': 'ok'})[0], 'gpu')
++        self.assertGreater(self.probes(), before)
++
++    def test_without_glxinfo_nothing_is_decided_or_remembered(self):
++        self.glxinfo.unlink()
++        mode, result = self.mode()
++        self.assertEqual(mode, 'gpu')
++        self.assertIn('not checked', result.stderr)
++        self.assertFalse((self.x64 / '.droiddeck-gl-mode').exists())
++
++    def test_without_a_display_nothing_is_decided_or_remembered(self):
++        mode, result = self.mode({'DISPLAY': ''})
++        self.assertEqual(mode, 'gpu')
++        self.assertIn('no X display', result.stderr)
++        self.assertFalse((self.x64 / '.droiddeck-gl-mode').exists())
++
++    def test_without_gpu_thunks_only_software_is_tried(self):
++        mode, _ = self.mode({'FAKE_THUNKS': '0'})
++        self.assertEqual(mode, 'software')
++        self.assertEqual(self.probes(), 1)
++
++    def test_a_hanging_gpu_check_counts_as_a_failure(self):
++        start = time.monotonic()
++        mode, _ = self.mode({'FAKE_GPU': 'hang', 'BL_X64_GL_PROBE_TIMEOUT': '2'})
++        self.assertEqual(mode, 'software')
++        self.assertLess(time.monotonic() - start, 20)
++
++
++class ExecTest(Launcher):
++    def run_exec(self, env):
++        # Output to files, as the launcher does (>>"$LOG"): x64_exec leaves a `tail --pid=$$` behind that would keep a
++        # pipe open until this process reaps the client, which Python only does once the pipes are closed.
++        out, err = self.root / 'exec.out', self.root / 'exec.err'
++        result = self.bash(EXEC + 'BL_X64_FIRST_FRAME_WATCH=0\n'
++                           '( x64_exec -clientbeta publicbeta -no-cef-sandbox -cef-force-gpu -cef-ozone-platform=x11 '
++                           '-cef-use-gl=angle -cef-use-angle=vulkan -gamepadui ) > %s 2> %s\n'
++                           'cat %s; cat %s >&2\n' % (out, err, out, err), env)
++        self.assertEqual(result.returncode, 0, result.stderr)
++        return result
++
++    def test_a_failing_gpu_path_starts_the_client_with_verified_software_opengl(self):
++        result = self.run_exec({})
++        self.assertIn('LIBGL_ALWAYS_SOFTWARE=1 GALLIUM_DRIVER=llvmpipe FEX_THUNKCONFIG= ', result.stdout)
++        client = next(line for line in result.stdout.splitlines() if line.startswith('CLIENT '))
++        self.assertIn('-cef-disable-gpu', client)
++        self.assertNotIn('-cef-force-gpu', client)
++        self.assertNotIn('-cef-use-gl=angle', client)
++        self.assertIn("Steam's menus use software OpenGL", result.stderr)
++
++    def test_a_working_gpu_path_is_kept(self):
++        result = self.run_exec({'FAKE_GPU': 'ok'})
++        self.assertIn('FEX_THUNKCONFIG=%s/thunks.json' % self.x64, result.stdout)
++        self.assertIn('-cef-force-gpu', next(line for line in result.stdout.splitlines() if line.startswith('CLIENT ')))
++
++    def test_the_check_can_be_turned_off(self):
++        result = self.run_exec({'BL_X64_GL_PROBE': '0'})
++        self.assertEqual(self.probes(), 0)
++        self.assertIn('FEX_THUNKCONFIG=%s/thunks.json' % self.x64, result.stdout)
++
++
++class FirstFrameWatchTest(Launcher):
+     def run_watch(self, mode, during='', seconds=20, env=None):
+-        script = ('step() { echo "== STEP $*"; }\n' + HELPERS +
+-                  'REAL_HOME=%s X64_HOME=%s STEAM_X64=%s X64_CHANNEL=publicbeta\n'
+-                  'sleep 300 & client=$!\n'
+-                  'x64_first_frame_watch "$client" %s &\nwatch=$!\n%s\n'
+-                  'wait "$watch"; if kill -0 "$client" 2>/dev/null; then echo CLIENT-ALIVE; kill "$client"; else echo CLIENT-STOPPED; fi\n'
+-                  % (self.home, self.x64, self.steam, mode, during))
+-        environment = dict(os.environ, BL_X64_WATCH_TICK='1', BL_X64_WATCH_SAY='2', BL_X64_WATCH_STALL='3',
+-                           BL_X64_WATCH_MIN='4', **(env or {}))
+-        return subprocess.run(['bash', '-u', '-c', script], env=environment, capture_output=True, text=True,
+-                              timeout=seconds + 40)
+-
+-    def test_gpu_renderer_giving_up_restarts_once_with_software_rendering(self):
+-        result = self.run_watch('gpu', 'sleep 1; for i in 1 2; do echo "GPU process exited unexpectedly: exit_code=139" >> %s; done; '
+-                                       'echo "GPU process isn\'t usable. Goodbye." >> %s' % (self.console, self.console))
++        body = ('sleep 300 & client=$!\n'
++                'x64_first_frame_watch "$client" %s &\nwatch=$!\n%s\n'
++                'wait "$watch"; if kill -0 "$client" 2>/dev/null; then echo CLIENT-ALIVE; kill "$client"; else echo CLIENT-STOPPED; fi\n'
++                % (mode, during))
++        return self.bash(body, dict(BL_X64_WATCH_TICK='1', BL_X64_WATCH_SAY='2', BL_X64_WATCH_STALL='3',
++                                    BL_X64_WATCH_MIN='4', **(env or {})), timeout=seconds + 40)
++
++    def append(self, path, text, delay=1):
++        return 'sleep %d; printf %%s %s >> %s' % (delay, self.quote(text), path)
++
++    @staticmethod
++    def quote(text):
++        return "'" + text.replace("'", "'\\''") + "'"
++
++    def frame(self, delay):
++        return 'sleep %d; : > %s/.bl-first-frame' % (delay, self.home)
++
++    def test_the_watch_survives_set_e_and_reports_progress(self):
++        # 0.7.1-sd685.3: under the launcher's set -e the first grep that found nothing ended the watch silently
++        result = self.run_watch('software', self.frame(4))
++        self.assertIn('CLIENT-ALIVE', result.stdout)
++        self.assertRegex(result.stdout, r'steam is still starting: \d+ s, client cpu \d+%.*, web helper restarts 0, OpenGL software')
++
++    def test_the_composer_without_opengl_restarts_steam_once_with_verified_software_opengl(self):
++        result = self.run_watch('gpu', self.append(self.helper, GL_FAILED))
++        self.assertIn('CLIENT-STOPPED', result.stdout)
++        self.assertIn("steam's menus could not use OpenGL on the GPU (1 refused, 0 web helper restarts): restarting Steam with software OpenGL", result.stdout)
++        self.assertEqual(self.gl_mode_file()[:2], ['v1 test', 'software'])
++        self.assertIn('llvmpipe', self.gl_mode_file()[2])
++        self.assertEqual((self.x64 / '.droiddeck-cef-software').read_text().splitlines()[0], '1795048523')
++        self.assertTrue((self.home / '.bl-restart-software').exists())
++        self.assertIn('cause opengl', (self.steam / 'package/droiddeck-unconfirmed').read_text())
++
++    def test_web_helper_restarts_are_noticed_without_the_client_dying(self):
++        result = self.run_watch('gpu', self.append(self.html, RESTART * 2))
+         self.assertIn('CLIENT-STOPPED', result.stdout)
+-        self.assertIn("steam's menus failed on the GPU (2 GPU process exits): restarting Steam with software rendering", result.stdout)
+-        soft = (self.x64 / '.droiddeck-cef-software').read_text().splitlines()
+-        self.assertEqual(soft[0], '1763000000')
++        self.assertIn('(0 refused, 2 web helper restarts): restarting Steam with software OpenGL', result.stdout)
+         self.assertTrue((self.home / '.bl-restart-software').exists())
+ 
+-    def test_gpu_errors_from_an_earlier_run_are_not_counted(self):
++    def test_no_software_restart_when_software_opengl_does_not_work_either_and_no_endless_loop(self):
++        during = self.append(self.helper, GL_FAILED) + '; ' + self.append(self.html, RESTART * 4, delay=3)
++        result = self.run_watch('gpu', during, env={'FAKE_SOFT': 'fail'})
++        self.assertIn('CLIENT-STOPPED', result.stdout)
++        self.assertIn('software OpenGL does not work here either', result.stdout)
++        self.assertIn('Steam restarted its web helper 4 times (OpenGL none, 1 contexts refused); Steam was stopped instead of looping', result.stdout)
++        self.assertFalse((self.home / '.bl-restart-software').exists())
++        self.assertEqual(self.gl_mode_file()[1], 'none')
++
++    def test_restarts_in_software_mode_stop_steam_at_the_limit(self):
++        result = self.run_watch('software', self.append(self.html, RESTART * 4))
++        self.assertIn('CLIENT-STOPPED', result.stdout)
++        self.assertIn('Steam restarted its web helper 4 times (OpenGL software, 0 contexts refused)', result.stdout)
++        self.assertFalse((self.home / '.bl-restart-software').exists())
++        self.assertIn('still restarted', self.gl_mode_file()[2])
++        # no OpenGL failure was seen, so a repair of the client's files stays possible
++        self.assertNotIn('cause opengl', (self.steam / 'package/droiddeck-unconfirmed').read_text())
++
++    def test_restarts_and_errors_from_earlier_runs_are_not_counted(self):
++        self.html.write_text(RESTART * 23)
++        self.helper.write_text(GL_FAILED * 14)
+         self.console.write_text("GPU process isn't usable. Goodbye.\n" * 3)
+-        result = self.run_watch('gpu', 'sleep 3; : > %s/.bl-first-frame' % self.home)
++        result = self.run_watch('gpu', self.frame(3))
+         self.assertIn('CLIENT-ALIVE', result.stdout)
+         self.assertFalse((self.x64 / '.droiddeck-cef-software').exists())
++        self.assertFalse((self.x64 / '.droiddeck-gl-mode').exists())
++
++    def test_a_log_steam_rotated_is_read_from_its_start(self):
++        self.helper.write_text('old\n' * 50)
++        result = self.run_watch('gpu', 'sleep 1; printf %%s %s > %s' % (self.quote(GL_FAILED), self.helper))
++        self.assertIn('restarting Steam with software OpenGL', result.stdout)
++
++    def test_without_glxinfo_steams_next_start_is_the_check_and_the_limit_still_applies(self):
++        self.glxinfo.unlink()
++        result = self.run_watch('gpu', self.append(self.helper, GL_FAILED))
++        self.assertIn('restarting Steam with software OpenGL', result.stdout)
++        self.assertIn('not checked beforehand', self.gl_mode_file()[2])
++
++    def test_chromium_giving_up_on_the_gpu_also_moves_to_software(self):
++        result = self.run_watch('gpu', self.append(self.console, 'GPU process exited unexpectedly: exit_code=139\n' * 2 +
++                                                   "GPU process isn't usable. Goodbye.\n"))
++        self.assertIn('CLIENT-STOPPED', result.stdout)
++        self.assertIn('restarting Steam with software OpenGL', result.stdout)
+ 
+     def test_the_first_frame_ends_the_watch_without_touching_the_client(self):
+-        result = self.run_watch('gpu', 'sleep 2; : > %s/.bl-first-frame' % self.home)
++        result = self.run_watch('gpu', self.frame(2))
+         self.assertIn('CLIENT-ALIVE', result.stdout)
+         self.assertNotIn('restarting', result.stdout)
+         # the build that reached the screen is remembered, so its next start can skip re-verifying its files
+-        self.assertEqual((self.x64 / '.droiddeck-client-ok').read_text().strip(), '1763000000')
++        self.assertEqual((self.x64 / '.droiddeck-client-ok').read_text().strip(), '1795048523')
+ 
+-    def test_a_stalled_client_on_the_gpu_renderer_is_restarted_with_software_rendering(self):
++    def test_a_stalled_client_on_the_gpu_moves_to_verified_software_opengl(self):
+         result = self.run_watch('gpu')
+         self.assertIn('CLIENT-STOPPED', result.stdout)
+         self.assertIn('shows no image: restarting Steam with software rendering', result.stdout)
+-        self.assertIn('stopped doing anything', (self.x64 / '.droiddeck-cef-software').read_text())
++        self.assertIn('stopped doing anything', self.gl_mode_file()[2])
+ 
+-    def test_a_stalled_client_in_software_mode_is_only_reported(self):
+-        result = self.run_watch('software', 'sleep 7; : > %s/.bl-first-frame' % self.home)
++    def test_a_stalled_client_is_only_reported_when_software_opengl_does_not_work(self):
++        result = self.run_watch('gpu', self.frame(7), env={'FAKE_SOFT': 'fail'})
+         self.assertIn('CLIENT-ALIVE', result.stdout)
+         self.assertIn('shows no image: share the logs from the menu', result.stdout)
+         self.assertFalse((self.home / '.bl-restart-software').exists())
+ 
+-    def test_progress_is_reported_while_it_starts(self):
+-        result = self.run_watch('software', 'sleep 3; : > %s/.bl-first-frame' % self.home)
+-        self.assertRegex(result.stdout, r'steam is still starting: \d+ s, client cpu \d+%')
++    def test_a_stalled_client_in_software_mode_is_only_reported(self):
++        result = self.run_watch('software', self.frame(7))
++        self.assertIn('CLIENT-ALIVE', result.stdout)
++        self.assertIn('shows no image: share the logs from the menu', result.stdout)
++        self.assertFalse((self.home / '.bl-restart-software').exists())
+ 
+     def test_a_missing_library_is_named(self):
+-        result = self.run_watch('software', 'sleep 1; echo "steamwebhelper: error while loading shared libraries: libnss3.so: cannot open" >> %s; '
+-                                            'sleep 3; : > %s/.bl-first-frame' % (self.console, self.home))
++        during = self.append(self.console, 'steamwebhelper: error while loading shared libraries: libnss3.so: cannot open\n') + '; ' + self.frame(3)
++        result = self.run_watch('software', during)
+         self.assertIn('missing library libnss3.so', result.stdout)
+ 
+ 
++class RepairTest(Launcher):
++    def repair(self, unconfirmed, env=None):
++        (self.steam / 'package/droiddeck-unconfirmed').write_text(unconfirmed)
++        result = self.bash('unconfirmed=$STEAM_X64/package/droiddeck-unconfirmed\n' + REPAIR + 'echo "REPAIR=$x64_repair"\n', env)
++        self.assertEqual(result.returncode, 0, result.stderr)
++        return result.stdout
++
++    def test_two_starts_without_an_image_repair_the_client(self):
++        self.assertIn('REPAIR=the client was started 2 times without showing anything', self.repair('tracked\nstart\nstart\n'))
++
++    def test_an_opengl_cause_does_not_download_the_client_again(self):
++        out = self.repair('tracked\nstart\ncause opengl\nstart\n')
++        self.assertIn('REPAIR=\n', out)
++        self.assertIn('not downloading the x86-64 Steam client again', out)
++
++    def test_a_requested_repair_still_happens_and_checks_opengl_again(self):
++        self.assertIn('REPAIR=requested', self.repair('tracked\nstart\ncause opengl\nstart\n', {'BL_X64_REPAIR': '1'}))
++        repair = between(X64, 'step "repairing the x86-64 Steam client ($x64_repair)"', 'fi\n')
++        self.assertIn('.droiddeck-gl-mode', repair)
++        self.assertIn('.droiddeck-client-ok', repair)
++
++
+ class SessionLoopTest(unittest.TestCase):
+     def test_the_session_restarts_the_client_once_for_software_rendering(self):
+         block = between(SESSION, 'if [ -f "$HOME/.bl-restart-software" ]; then', 'if [ "$steam_x64" = 1 ] && [ "$rc" -eq 132 ]')
+@@ -109,8 +369,6 @@ class SessionLoopTest(unittest.TestCase):
+         self.assertIn('[ "$(cat "$x64_home/.droiddeck-client-ok" 2>/dev/null)" = "$build" ]', block)
+         self.assertIn('set -- "$@" -noverifyfiles', block)
+         self.assertIn('rm -f "$x64_home/.droiddeck-client-ok"', block)
+-        repair = between(X64, 'step "repairing the x86-64 Steam client ($x64_repair)"', 'fi\n')
+-        self.assertIn('.droiddeck-client-ok', repair)
+ 
+     def test_runtime_links_are_rebuilt_only_when_the_runtime_changes(self):
+         block = between(X64, 'srt_libs=$X64_HOME/steamrt-libs', 'tool=$STEAM_X64/compatibilitytools.d/droiddeck-direct')
+@@ -128,6 +386,10 @@ class SessionLoopTest(unittest.TestCase):
+         self.assertIn('export BL_X64_CEF_GPU=0', block)
+         self.assertIn('rm -f "$soft_file"', block)
+ 
++    def test_the_watch_does_not_inherit_set_e(self):
++        watch = between(X64, 'x64_first_frame_watch() {', '\n}\n')
++        self.assertTrue(watch.split('\n')[1].strip() == 'set +e', watch.split('\n')[1])
++
+ 
+ if __name__ == '__main__':
+     unittest.main()
+-- 
+2.43.0
+

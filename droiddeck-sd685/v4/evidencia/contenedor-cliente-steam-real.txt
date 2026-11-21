@@ -1,0 +1,32 @@
+# Valve's x86-64 Steam client 1795048523 (steamdeck_publicbeta, the phone's build), run natively in the phone's x86 rootfs
+# (chroot on the container's x86-64 CPU, no FEX), Xvfb, flags as droiddeck-steam-x64: -gamepadui -steamdeck -steamos3 -no-cef-sandbox
+# plus -skipinitialbootstrap -noverifyfiles -norepairfiles (no direct internet here for Steam's updater).
+
+## 1. OpenGL broken the phone's way (zink with no Vulkan driver): the same Mesa errors as the phone's console-linux.txt
+      1 [2026-11-21 16:26:54] MESA: error: ZINK: vkCreateInstance failed (VK_ERROR_INCOMPATIBLE_DRIVER)
+      1 [2026-11-21 16:26:54] [2026-11-21 16:26:54] Process started with command-line: '/root/.droiddeck-x64/.local/share/Steam/steamrt64/steam' '-child-update-ui' '-child-update-ui-socket' '8' '-gamepadui' '-steamdeck' '-steamos3' '-language' 'latam' '-clientbeta' 'steamdeck_publicbeta' '-no-cef-sandbox' '-skipinitialbootstrap' '-noverifyfiles' '-norepairfiles' '-cef-force-gpu' '-cef-ozone-platform=x11' '-cef-use-gl=angle' '-cef-use-angle=vulkan'
+      1 [2026-11-21 16:26:54] [2026-11-21 16:26:54] Startup - Steam Client launched with: '/root/.droiddeck-x64/.local/share/Steam/steamrt64/steam' '-gamepadui' '-steamdeck' '-steamos3' '-language' 'latam' '-clientbeta' 'steamdeck_publicbeta' '-no-cef-sandbox' '-skipinitialbootstrap' '-noverifyfiles' '-norepairfiles' '-cef-force-gpu' '-cef-ozone-platform=x11' '-cef-use-gl=angle' '-cef-use-angle=vulkan'
+      1 [2026-11-21 16:26:54] failed to load driver: zink
+      1 [2026-11-21 16:26:54] glx: failed to create drisw screen
+      1 [2026-11-21 16:26:55] MESA: error: ZINK: vkCreateInstance failed (VK_ERROR_INCOMPATIBLE_DRIVER)
+      1 [2026-11-21 16:26:55] Running query: 1 - GpuTopology
+      1 [2026-11-21 16:26:55] failed to load driver: zink
+      1 [2026-11-21 16:26:55] glx: failed to create drisw screen
+      1 [2026-11-21 16:26:56] CVulkanTopology: failed create vulkan instance: -9
+      1 [2026-11-21 16:26:56] CVulkanTopology: failed to create vulkan instanceFailed to query vulkan gpu topology
+      1 [2026-11-21 16:26:56] Failed to query vulkan gpu topology
+
+## 2. droiddeck-steam-x64's software branch (LIBGL_ALWAYS_SOFTWARE=1 GALLIUM_DRIVER=llvmpipe, -cef-disable-gpu)
+[2026-11-21 16:27:34]     name: "llvmpipe (LLVM 20.1.8, 256 bits)"
+[2026-11-21 16:27:34]     driver_id: k_EGpuDriverId_MesaLLVMPipe
+[2026-11-21 16:27:34] Exit code: 0
+[2026-11-21 16:27:35] Disabling GPU acceleration due to --disable-gpu-compositing (browser)
+[2026-11-21 16:27:37] Browser requested transparent background, but it is not supported
+[2026-11-21 16:27:37] SP Shared JS Context-'SharedJSCo': STARTUP FirstPaint t=2.819 +96.3ms from create
+failed to acquire a gl context lines in the software run: 0
+glXChooseVisual failures in the software run: 0
+
+## 3. Why the menu itself could not be reached here (container, not the phone): Steam's internal websocket between the
+## client and steamwebhelper was rejected (0x3009 'Error inesperado de transporte'); the phone's logs show it connected.
+[2026-11-21 16:27:39] WebUITransport: Connection rejected
+[2026-11-21 16:27:40] WebUITransport: Connection rejected

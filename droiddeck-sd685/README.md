@@ -1,9 +1,11 @@
 # DroidDeck 0.7.1-sd685 — versión para Redmi Note 13 (Snapdragon 685 / Adreno 610)
 
-> **Versión más reciente: [v3 — 0.7.1-sd685.3](v3/README.md).** Recuperación del bloqueo "Esperando el
-> primer fotograma de Steam", arranque de Steam con menos trabajo repetido, tiempos de inicio medidos,
-> región de Xbox Cloud por latencia, calidad automática y estadísticas reales.
-> Anterior: [v2 — 0.7.1-sd685.2](v2/README.md) (Proton ARM64 para tu CPU, perfiles, 30 Hz).
+> **Versión más reciente: [v4 — 0.7.1-sd685.4](v4/README.md).** Basada en tus registros reales: el menú de
+> Steam no aparecía porque su compositor no obtiene OpenGL a través de FEX y Steam reiniciaba su ayudante web
+> sin fin. La v4 comprueba en el teléfono qué OpenGL funciona y solo usa uno verificado, detecta los reinicios,
+> no repite sin fin, y corrige la instalación del Proton ARMv8.0.
+> Anteriores: [v3 — 0.7.1-sd685.3](v3/README.md) (tiempos de inicio, Xbox Cloud por latencia, estadísticas),
+> [v2 — 0.7.1-sd685.2](v2/README.md) (Proton ARM64 para tu CPU, perfiles, 30 Hz).
 > Lo que sigue describe la **v1**, que se conserva como copia de seguridad.
 
 Versión modificada de [DroidDeck](https://github.com/Droid-Deck/DroidDeck) 0.7.1 (GPL-3.0) que corrige el

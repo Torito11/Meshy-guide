@@ -1,0 +1,11 @@
+# Kotlin unit tests (testDebugUnitTest), contenedor, commit 65bf8f1
+total 3889 tests, 0 failures, 0 errors, 10 skipped (by the project), 520 classes
+
+# New or changed in v4:
+com.droiddeck.launcher.session.Armv80ProtonComponentsTest                   tests=1 failures=0 errors=0 skipped=0
+com.droiddeck.launcher.session.ComponentUpdatesTest                         tests=38 failures=0 errors=0 skipped=1
+com.droiddeck.launcher.session.DiagnosticsExtrasTest                        tests=2 failures=0 errors=0 skipped=0
+com.droiddeck.launcher.session.EnhancedSessionLogShareTest                  tests=20 failures=0 errors=0 skipped=1
+com.droiddeck.launcher.session.LoadingStateTest                             tests=4 failures=0 errors=0 skipped=0
+com.droiddeck.launcher.session.LoadingStepExplainedTest                     tests=6 failures=0 errors=0 skipped=0
+com.droiddeck.launcher.session.PowerVrQueuedComponentsTest                  tests=1 failures=0 errors=0 skipped=0

@@ -1,0 +1,29 @@
+webhelper.txt        <- steam/entry-880d0f6f9c9efbb6.txt
+steamui_html.txt     <- steam/entry-b94fac34e0729b03.txt
+console-linux.txt    <- steam/entry-d20ccf3f76b94466.txt
+webhelper_gpu.txt    <- steam/entry-f059c52eb5241d0a.txt
+bootstrap_log.txt    <- steam/entry-4d71bc0594791d02.txt
+
+   24  webhelper.txt      CCompositorGLThread::CreateOutputWindow
+   14  webhelper.txt      failed to acquire a gl context
+   14  webhelper.txt      Falling back to system composer
+   23  steamui_html.txt   Restart webhelper process
+    0  console-linux.txt  GPU process exited unexpectedly
+    0  console-linux.txt  GPU process isn't usable
+  100  console-linux.txt  failed to create dri3 screen
+  100  console-linux.txt  failed to load driver: zink
+    8  console-linux.txt  failed to load driver: swrast
+    1  console-linux.txt  ZINK: vkCreateInstance failed
+    1  console-linux.txt  vkEnumeratePhysicalDevices failed
+   27  webhelper_gpu.txt  GL implementation parts ]: (gl=none,angle=none)
+   27  webhelper_gpu.txt  GL_RENDERER ]: (null)
+
+wayland.log: 28 ten-second reports; scenes, game frames, distinct buffers: [('0', '0', '0'), ('12', '0', '0')]
+wayland.log GPU: Turnip Adreno (TM) 610 with libvulkan_freedreno.so
+
+steam-x64.log: "steam is still starting" lines (v3 watch alive): 0
+steam-x64.log: == STEP 22:57:03 repairing the x86-64 Steam client (the client was started 2 times without showing anything)
+session.log: droiddeck-proton-armv80: using the installed DroidDeck-Proton 11-12.8 as the base
+session.log: == STEP 15:53:53 installing DroidDeck-Proton 11-12.8 for ARMv8.0: rewriting 688 files
+session.log: droiddeck-proton-armv80: files/lib/wine/vkd3d-proton/aarch64-windows/d3d12.dll is not the file the patch was made for
+session.log: == STEP 15:53:54.231 Proton for ARMv8.0 could not be installed now; Windows games use droiddeck-proton-x64 until it is

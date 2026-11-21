@@ -1,0 +1,33 @@
+From 65bf8f1956b4316d9de6e24f88ba090622e18505 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 21 Nov 2026 17:55:59 +0000
+Subject: [PATCH 21/21] chore(steam): name each distinct OpenGL error once in
+ the launcher's log
+
+Mesa repeats its errors for every screen it tries (an ARMv8.0 VM with the phone's FEX printed "failed to
+load driver: zink" nine times), which filled the OpenGL decision kept in .droiddeck-gl-mode and
+x64-gl-probe.txt. Each distinct line now appears once.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ tools/linuxfs/overlay/usr/local/bin/droiddeck-steam-x64 | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/tools/linuxfs/overlay/usr/local/bin/droiddeck-steam-x64 b/tools/linuxfs/overlay/usr/local/bin/droiddeck-steam-x64
+index f231b23..4e30ff6 100755
+--- a/tools/linuxfs/overlay/usr/local/bin/droiddeck-steam-x64
++++ b/tools/linuxfs/overlay/usr/local/bin/droiddeck-steam-x64
+@@ -970,7 +970,9 @@ x64_gl_try() {
+     fi
+     timeout "${BL_X64_GL_PROBE_TIMEOUT:-90}" "$fex" /usr/bin/glxinfo -B 2>&1
+   ) || rc=$?
+-  printf '%s\n' "$out" | grep -E "OpenGL renderer string|OpenGL core profile version|direct rendering|rror|failed|unable" | head -8
++  # Each distinct line once: Mesa repeats its errors for every screen it tries.
++  printf '%s\n' "$out" | grep -E "OpenGL renderer string|OpenGL core profile version|direct rendering|rror|failed|unable" |
++    awk '!seen[$0]++' | head -6
+   [ "$rc" = 0 ] && printf '%s\n' "$out" | grep -q "OpenGL renderer string"
+ }
+ 
+-- 
+2.43.0
+

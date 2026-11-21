@@ -1,0 +1,110 @@
+## Archivo
+-rw-r--r-- 1 root root 97299974 Nov 21 18:00 /tmp/claude-0/-home-user-Meshy-guide/a08a5fc9-8ff9-5f60-83e1-8c06b3b3ee87/scratchpad/DroidDeck-0.7.1-sd685.4.apk
+0c5c1cb2f5da6264421df6513ea07620373910e717054780f07efaa010b6ae54  /tmp/claude-0/-home-user-Meshy-guide/a08a5fc9-8ff9-5f60-83e1-8c06b3b3ee87/scratchpad/DroidDeck-0.7.1-sd685.4.apk
+
+## aapt badging
+package: name='com.droiddeck.launcher.sd685' versionCode='19' versionName='0.7.1-sd685.4' platformBuildVersionName='14' platformBuildVersionCode='34' compileSdkVersion='34' compileSdkVersionCodename='14'
+sdkVersion:'26'
+targetSdkVersion:'28'
+application-label:'DroidDeck SD685'
+application: label='DroidDeck SD685'
+native-code: 'arm64-v8a'
+
+## authorities / task affinities en el manifiesto
+A: android:authorities(0x01010018)="com.droiddeck.launcher.sd685.agent" (Raw: "com.droiddeck.launcher.sd685.agent")
+A: android:authorities(0x01010018)="com.droiddeck.launcher.sd685.androidx-startup" (Raw: "com.droiddeck.launcher.sd685.androidx-startup")
+A: android:authorities(0x01010018)="com.droiddeck.launcher.sd685.documents" (Raw: "com.droiddeck.launcher.sd685.documents")
+A: android:authorities(0x01010018)="com.droiddeck.launcher.sd685.logs" (Raw: "com.droiddeck.launcher.sd685.logs")
+A: android:authorities(0x01010018)="org.khronos.openxr.runtime_broker;org.khronos.openxr.system_runtime_broker" (Raw: "org.khronos.openxr.runtime_broker;org.khronos.openxr.system_runtime_broker")
+A: android:taskAffinity(0x01010012)="com.droiddeck.launcher.sd685.dualscreen" (Raw: "com.droiddeck.launcher.sd685.dualscreen")
+A: android:taskAffinity(0x01010012)="com.droiddeck.launcher.sd685.home" (Raw: "com.droiddeck.launcher.sd685.home")
+A: android:taskAffinity(0x01010012)="com.droiddeck.launcher.sd685.pairingguide" (Raw: "com.droiddeck.launcher.sd685.pairingguide")
+A: android:taskAffinity(0x01010012)="com.droiddeck.launcher.sd685.pin" (Raw: "com.droiddeck.launcher.sd685.pin")
+A: android:taskAffinity(0x01010012)="com.droiddeck.launcher.sd685.typing" (Raw: "com.droiddeck.launcher.sd685.typing")
+A: android:taskAffinity(0x01010012)="com.droiddeck.launcher.sd685.vr_recovery" (Raw: "com.droiddeck.launcher.sd685.vr_recovery")
+
+## apksigner
+Verifies
+Verified using v1 scheme (JAR signing): false
+Verified using v2 scheme (APK Signature Scheme v2): true
+Verified using v3 scheme (APK Signature Scheme v3): true
+Signer #1 certificate DN: EMAILADDRESS=android@android.com, CN=Android, OU=Android, O=Android, L=Mountain View, ST=California, C=US
+Signer #1 certificate SHA-256 digest: a40da80a59d170caa950cf15c18c454d47a39b26989d8b640ecd745ba71bf5dc
+
+## zipalign
+zipalign: OK (4-byte, page-aligned .so)
+
+## check_session_assets.py
+APK session helpers match source
+check_session_assets: OK
+
+## runtime_inputs.py apk
+Runtime inputs verified
+runtime_inputs apk: OK
+
+## check_android_libraries.py
+APK native exports and dependencies verified
+check_android_libraries: OK
+
+## Cambios presentes dentro de la APK
+OK   assets/linuxfs/usr/local/bin/droiddeck-steam-x64 contiene 'droiddeck-proton-x64'
+OK   assets/linuxfs/usr/local/bin/droiddeck-session contiene 'bl_cpu_armv80'
+OK   assets/linuxfs/usr/local/bin/steam-compatibility contiene 'armv80 = tool.lower()'
+OK   assets/linuxfs/usr/local/bin/droiddeck-steam-x64 contiene '.droiddeck-armv80'
+OK   assets/linuxfs/usr/local/bin/droiddeck-session contiene 'droiddeck-proton-armv80'
+OK   assets/linuxfs/usr/local/bin/droiddeck-session contiene 'BL_CLIENT_PIN_GAMESCOPE'
+OK   assets/linuxfs/usr/local/bin/droiddeck-proton-armv80 contiene 'LSE80PATCH1'
+OK   assets/linuxfs/usr/local/bin/steam-compatibility contiene 'endswith("-armv80")'
+OK   assets/linuxfs/usr/local/bin/droiddeck-steam-x64 contiene 'x64_first_frame_watch'
+OK   assets/linuxfs/usr/local/bin/droiddeck-steam-x64 contiene '.droiddeck-cef-software'
+OK   assets/linuxfs/usr/local/bin/droiddeck-steam-x64 contiene '-noverifyfiles'
+OK   assets/linuxfs/usr/local/bin/droiddeck-steam-x64 contiene '.droiddeck-stamp'
+OK   assets/linuxfs/usr/local/bin/droiddeck-session contiene '.bl-restart-software'
+OK   assets/linuxfs/usr/local/bin/droiddeck-game-env contiene 'def mark_launch'
+OK   assets/linuxfs/usr/local/bin/droiddeck-proton-armv80 contiene 'def download(url, tarball)'
+OK   assets/linuxfs/usr/local/bin/droiddeck-steam-x64 contiene 'x64_gl_mode() {'
+OK   assets/linuxfs/usr/local/bin/droiddeck-steam-x64 contiene 'x64_gl_try() {'
+OK   assets/linuxfs/usr/local/bin/droiddeck-steam-x64 contiene 'failed to acquire a gl context'
+OK   assets/linuxfs/usr/local/bin/droiddeck-steam-x64 contiene 'Restart webhelper process'
+OK   assets/linuxfs/usr/local/bin/droiddeck-steam-x64 contiene 'cause opengl'
+OK   assets/linuxfs/usr/local/bin/droiddeck-steam-x64 contiene 'BL_X64_WATCH_RESTARTS'
+OK   assets/linuxfs/usr/local/bin/droiddeck-proton-armv80 contiene 'def changed_file('
+OK   assets/linuxfs/usr/local/bin/droiddeck-proton-armv80 contiene 'base-changed'
+OK   assets/linuxfs/usr/local/bin/droiddeck-steam-x64 contiene 'Each distinct line once' (comprobado aparte: el texto buscado anterior lo había alterado el propio script de verificación)
+OK   parche ARMv8.0 en la APK, sha256 f81560c57b77b40aac6f4a519c98cbd5ae1a44885cdb75a835853de5cde84390
+OK   clase com.droiddeck.launcher.core.CpuFeatures en el dex
+OK   clase com.droiddeck.launcher.core.LowTierDevice en el dex
+OK   clase com.droiddeck.launcher.core.PerformanceProfiles en el dex
+OK   clase session/StartupTimes en el dex
+OK   clase session/DiagnosticsExtras en el dex
+OK   clase stores/xbox/XboxCloudStats en el dex
+OK   clase stores/xbox/XboxCloudNetwork en el dex
+OK   texto loadstate_gl_check en 3 idiomas (en, es, es-419)
+OK   texto loadstate_gl_software_restart en 3 idiomas (en, es, es-419)
+OK   texto loadstate_gl_none en 3 idiomas (en, es, es-419)
+OK   texto loadstate_webhelper_loop en 3 idiomas (en, es, es-419)
+OK   texto loadstate_webhelper_restarts en 3 idiomas (en, es, es-419)
+OK   texto loadstate_no_redownload en 3 idiomas (en, es, es-419)
+OK   texto loadstate_proton_base_changed en 3 idiomas (en, es, es-419)
+
+## Comparación con la APK oficial 0.7.1
+entries: 596 vs 598; identical: 565; different: 31; only first: 0; only second: 2
+  only in second: assets/linuxfs/usr/local/bin/droiddeck-proton-armv80
+  only in second: assets/linuxfs/usr/local/share/droiddeck-armv80/DroidDeck-Proton-11-12.8.lse80
+  differs [AndroidManifest.xml] (1): AndroidManifest.xml
+  differs [META-INF] (1): version-control-info.textproto
+  differs [assets] (2): baseline.prof, baseline.profm
+  differs [assets/linuxfs/usr/local/bin] (5): droiddeck-game-env, droiddeck-session, droiddeck-steam-x64, droiddeck-steamrt-shim, steam-compatibility
+  differs [classes.dex] (1): classes.dex
+  differs [classes2.dex] (1): classes2.dex
+  differs [classes3.dex] (1): classes3.dex
+  differs [classes4.dex] (1): classes4.dex
+  differs [classes5.dex] (1): classes5.dex
+  differs [lib] (15): libc++_shared.so, libddvenc.so, libdeviceinfo.so, libdroiddeckstores.so, libdroiddeckwayland.so, libdroiddeckxr.so, libfile_redirect_hook.so, libgpuclock.so, libgsl_alloc_hook.so, libhook_impl.so, libmain_hook.so, libsdnative.so ...
+  differs [res] (1): cq.xml
+  differs [resources.arsc] (1): resources.arsc
+
+## Escaneo ARMv8.0 de los ELF ARM64 de la APK
+ELF ARM64 escaneados: 75
+con atomics LSE sin comprobación:
+== lib/arm64-v8a/libsyncthingnative.so

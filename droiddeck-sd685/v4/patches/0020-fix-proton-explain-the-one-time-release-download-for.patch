@@ -1,0 +1,91 @@
+From f11c2c4383ef0abf4a11a097ec465305f4e88a5a Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 21 Nov 2026 16:49:43 +0000
+Subject: [PATCH 20/21] fix(proton): explain the one-time release download for
+ the ARMv8.0 build on the loading screen
+
+The step droiddeck-proton-armv80 writes when the installed DroidDeck-Proton 11-12.8 has component-updated
+files is shown in the app's language (en, es, es-419), with the file that was replaced.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../main/java/com/droiddeck/launcher/session/LoadingState.kt   | 2 ++
+ app/src/main/res/values-b+es+419/strings.xml                   | 1 +
+ app/src/main/res/values-es/strings.xml                         | 1 +
+ app/src/main/res/values/strings.xml                            | 1 +
+ .../com/droiddeck/launcher/session/LoadingStepExplainedTest.kt | 3 +++
+ 5 files changed, 8 insertions(+)
+
+diff --git a/app/src/main/java/com/droiddeck/launcher/session/LoadingState.kt b/app/src/main/java/com/droiddeck/launcher/session/LoadingState.kt
+index 67e1b08..746cae9 100644
+--- a/app/src/main/java/com/droiddeck/launcher/session/LoadingState.kt
++++ b/app/src/main/java/com/droiddeck/launcher/session/LoadingState.kt
+@@ -179,6 +179,7 @@ class LoadingState(context: Context, private val steam: Boolean = true) {
+             WEBHELPER_LOOP.find(scriptStep)?.let { return res.getString(com.droiddeck.launcher.R.string.loadstate_webhelper_loop, it.groupValues[1].toInt()) }
+             if (scriptStep.startsWith("checking which OpenGL Steam's menus can use")) return res.getString(com.droiddeck.launcher.R.string.loadstate_gl_check)
+             if (scriptStep.startsWith("not downloading the x86-64 Steam client again")) return res.getString(com.droiddeck.launcher.R.string.loadstate_no_redownload)
++            PROTON_BASE_CHANGED.find(scriptStep)?.let { return res.getString(com.droiddeck.launcher.R.string.loadstate_proton_base_changed, it.groupValues[1]) }
+             GPU_FAILED.find(scriptStep)?.let { return res.getString(com.droiddeck.launcher.R.string.loadstate_steam_gpu_failed, it.groupValues[1].toInt()) }
+             STALLED_RESTART.find(scriptStep)?.let { return res.getString(com.droiddeck.launcher.R.string.loadstate_steam_stalled_restart, it.groupValues[1].toInt()) }
+             STALLED.find(scriptStep)?.let { return res.getString(com.droiddeck.launcher.R.string.loadstate_steam_stalled, it.groupValues[1].toInt()) }
+@@ -191,6 +192,7 @@ class LoadingState(context: Context, private val steam: Boolean = true) {
+ 
+         private val BUSY = Regex("""^steam is still starting: (\d+) s, client cpu (\d+)%(?:, (\d+) MB free)?(, updating or verifying)?(?:, missing library ([^,\s]+))?(?:, web helper restarts (\d+), OpenGL (\w+))?""")
+         private val GL_SOFTWARE_RESTART = Regex("""^steam's menus could not use OpenGL on the GPU \((\d+) refused, (\d+) web helper restarts\): restarting""")
++        private val PROTON_BASE_CHANGED = Regex("""^the installed DroidDeck-Proton \S+ has (\S+) replaced""")
+         private val WEBHELPER_LOOP = Regex("""^steam's menus could not be shown: Steam restarted its web helper (\d+) times""")
+         private val GPU_FAILED = Regex("""^steam's menus failed on the GPU \((\d+) GPU process exits\)""")
+         private val STALLED_RESTART = Regex("""^steam has done nothing for (\d+) s and shows no image: restarting""")
+diff --git a/app/src/main/res/values-b+es+419/strings.xml b/app/src/main/res/values-b+es+419/strings.xml
+index 630d5f6..3590697 100644
+--- a/app/src/main/res/values-b+es+419/strings.xml
++++ b/app/src/main/res/values-b+es+419/strings.xml
+@@ -2098,6 +2098,7 @@
+     <string name="loadstate_webhelper_loop">No se pudo mostrar el menú de Steam: reinició su ayudante web %1$d veces. Se detuvo Steam en lugar de reintentarlo sin fin. Comparte los registros</string>
+     <string name="loadstate_webhelper_restarts">ayudante web reiniciado %1$d veces</string>
+     <string name="loadstate_no_redownload">No se vuelve a descargar el cliente de Steam: sus archivos están bien; su menú no pudo obtener OpenGL</string>
++    <string name="loadstate_proton_base_changed">Tu DroidDeck-Proton 11-12.8 tiene %1$s actualizado (actualizaciones de componentes): se descarga una vez la versión original para preparar la de ARMv8.0 (626 MB)</string>
+     <string name="pextra_busy">Ya se está instalando una herramienta de compatibilidad</string>
+     <string name="pextra_stop_session">Detén la sesión activa antes de instalar herramientas de compatibilidad</string>
+     <string name="pextra_no_release">No se encontró una versión ARM64 de %1$s</string>
+diff --git a/app/src/main/res/values-es/strings.xml b/app/src/main/res/values-es/strings.xml
+index d683b71..3620e5d 100644
+--- a/app/src/main/res/values-es/strings.xml
++++ b/app/src/main/res/values-es/strings.xml
+@@ -2043,6 +2043,7 @@
+     <string name="loadstate_webhelper_loop">No se pudo mostrar el menú de Steam: reinició su ayudante web %1$d veces. Se detuvo Steam en lugar de reintentarlo sin fin. Comparte los registros</string>
+     <string name="loadstate_webhelper_restarts">ayudante web reiniciado %1$d veces</string>
+     <string name="loadstate_no_redownload">No se vuelve a descargar el cliente de Steam: sus archivos están bien; su menú no pudo obtener OpenGL</string>
++    <string name="loadstate_proton_base_changed">Tu DroidDeck-Proton 11-12.8 tiene %1$s actualizado (actualizaciones de componentes): se descarga una vez la versión original para preparar la de ARMv8.0 (626 MB)</string>
+ 
+     <string name="pextra_busy">Ya se está instalando una herramienta de compatibilidad</string>
+     <string name="pextra_stop_session">Detén la sesión activa antes de instalar herramientas de compatibilidad</string>
+diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
+index 4cdbda6..517a31a 100644
+--- a/app/src/main/res/values/strings.xml
++++ b/app/src/main/res/values/strings.xml
+@@ -2225,6 +2225,7 @@
+     <string name="loadstate_webhelper_loop">Steam\'s menus could not be shown: Steam restarted its web helper %1$d times. Steam was stopped instead of retrying for ever. Share the logs</string>
+     <string name="loadstate_webhelper_restarts">web helper restarted %1$d times</string>
+     <string name="loadstate_no_redownload">The Steam client is not downloaded again: its files are fine; its menus could not get OpenGL</string>
++    <string name="loadstate_proton_base_changed">Your DroidDeck-Proton 11-12.8 has an updated %1$s (component updates): downloading the original release once to build the ARMv8.0 version (626 MB)</string>
+ 
+     <string name="pextra_busy">A compatibility tool install is already running</string>
+     <string name="pextra_stop_session">Stop the active session before installing compatibility tools</string>
+diff --git a/app/src/test/java/com/droiddeck/launcher/session/LoadingStepExplainedTest.kt b/app/src/test/java/com/droiddeck/launcher/session/LoadingStepExplainedTest.kt
+index e77f0d2..cfc713f 100644
+--- a/app/src/test/java/com/droiddeck/launcher/session/LoadingStepExplainedTest.kt
++++ b/app/src/test/java/com/droiddeck/launcher/session/LoadingStepExplainedTest.kt
+@@ -63,6 +63,9 @@ class LoadingStepExplainedTest {
+         assertTrue(LoadingState.explainedStep(res,
+             "not downloading the x86-64 Steam client again: it starts, but its menus could not get OpenGL (its files are not the cause)")!!
+             .contains("not downloaded again"))
++        assertEquals("Your DroidDeck-Proton 11-12.8 has an updated d3d12.dll (component updates): downloading the original release once to build the ARMv8.0 version (626 MB)",
++            LoadingState.explainedStep(res, "the installed DroidDeck-Proton 11-12.8 has d3d12.dll replaced (by a component update): " +
++                "installing the ARMv8.0 version from the original release instead (626 MB download, once)"))
+     }
+ 
+     @Test fun otherStepsKeepTheirText() {
+-- 
+2.43.0
+

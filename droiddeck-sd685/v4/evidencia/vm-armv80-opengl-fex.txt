@@ -1,0 +1,42 @@
+# ARMv8.0 VM: qemu-system-aarch64 -cpu cortex-a53 (CPU part 0xd03, no LSE atomics, same Features as the SD685), TCG emulation on the container.
+# Inside DroidDeck's arm64 Linux runtime ubuntu-r1-rc5 (Ubuntu 26.04, glibc 2.43, Mesa 26.0.8+droiddeck1; sha256 434d3d91...)
+# with the phone's FEX 2611-r10 (catalog fex.tzst, sha256 5d3b90fd...) and the phone's x86 rootfs (sha256 2854b06d...). X server: Xvfb.
+# Times are for an emulated CPU (much slower than the phone).
+
+## 1. Three ways to give an x86 program OpenGL (vm-gl-paths.sh)
+=== GPU path (thunks, zink): exit 0, 27 s
+      1 Error: couldn't find RGB GLX visual or fbconfig
+      9 MESA: error: ZINK: failed to choose pdev
+      9 failed to load driver: zink
+      9 glx: failed to create drisw screen
+=== host software (thunks, arm64 llvmpipe): exit 139, 15 s
+      1   Major opcode of failed request:  150 (GLX)
+      1   Minor opcode of failed request:  0 ()
+      1   Serial number of failed request:  24
+      1 X Error of failed request:  GLXBadFBConfig
+=== x86 software (no thunks, x86 llvmpipe under FEX): exit 0, 64 s
+      1 OpenGL core profile version string: 4.6 (Core Profile) Mesa 26.1.6 - kisak-mesa PPA
+      1 OpenGL renderer string: llvmpipe (LLVM 20.1.8, 256 bits)
+      1 direct rendering: Yes
+(GPU path: no GPU in the VM, so zink fails as it did on the phone; 'host software' = the arm64 runtime's llvmpipe through FEX's thunks: glxinfo crashes with GLXBadFBConfig, so v4 does NOT use it)
+
+## 2. v4's own functions (x64_gl_try / x64_gl_mode from droiddeck-steam-x64 as shipped in the APK), with the phone's GPU variables
+##    (MESA_LOADER_DRIVER_OVERRIDE=zink GALLIUM_DRIVER=zink LIBGL_KOPPER_DRI2=true). Lines 3-4 of .droiddeck-gl-mode follow RESULT.
+Features	: fp asimd evtstrm aes pmull sha1 sha2 crc32 cpuid
+LSE atomics: no (ARMv8.0, like the SD685)
+x64_gl_try software: status 0 in 41 s
+    direct rendering: Yes
+    OpenGL renderer string: llvmpipe (LLVM 20.1.8, 256 bits)
+    OpenGL core profile version string: 4.6 (Core Profile) Mesa 26.1.6 - kisak-mesa PPA
+x64_gl_try gpu: status 1 in 21 s
+    MESA: error: ZINK: failed to choose pdev
+    glx: failed to create drisw screen
+    failed to load driver: zink
+    Error: couldn't find RGB GLX visual or fbconfig
+== STEP 08:29:21 checking which OpenGL Steam's menus can use on this device (once, and after a driver or FEX change)
+== x86-64 OpenGL for Steam's menus: software (GPU through FEX's thunks failed (MESA: error: ZINK: failed to choose pdev; glx: failed to create drisw screen; failed to load driver: zink; Error: couldn't find RGB GLX visual or fbconfig); software: direct rendering: Yes; OpenGL renderer string: llvmpipe (LLVM 20.1.8, 256 bits); OpenGL core profile version string: 4.6 (Core Profile) Mesa 26.1.6 - kisak-mesa PPA)
+RESULT mode=software in 72 s
+vm-test
+software
+GPU through FEX's thunks failed (MESA: error: ZINK: failed to choose pdev; glx: failed to create drisw screen; failed to load driver: zink; Error: couldn't find RGB GLX visual or fbconfig); software: direct rendering: Yes; OpenGL renderer string: llvmpipe (LLVM 20.1.8, 256 bits); OpenGL core profile version string: 4.6 (Core Profile) Mesa 26.1.6 - kisak-mesa PPA
+2026-10-12

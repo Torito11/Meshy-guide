@@ -1,0 +1,382 @@
+From 9efea697e29c7309f283d5bd908c7dc0bdeadc05 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 21 Nov 2026 16:43:29 +0000
+Subject: [PATCH 18/21] fix(proton): install the ARMv8.0 build when the
+ installed release was changed by component updates
+
+A Snapdragon 685's log: droiddeck-proton-armv80 copied the installed DroidDeck-Proton 11-12.8 (2 GB,
+32 s) and then stopped on "files/lib/wine/vkd3d-proton/aarch64-windows/d3d12.dll is not the file the patch
+was made for", at every start, so the ARMv8.0 build was never installed. DroidDeck's component updates
+keep that release's DXVK, vkd3d-proton and FEX DLLs current, so its files are no longer the release's.
+
+- The files the component manager swaps are checked before the copy; any other changed file is caught
+  while patching. Either way the verified release is downloaded (resuming, once) and used instead, and a
+  changed base is remembered so it is not copied again after a failed download. The user's own tool is
+  never modified.
+- ComponentsManager.protons() leaves out the ARMv8.0 build (.droiddeck-armv80): a swapped-in or updated
+  DXVK, vkd3d-proton or FEX build would bring the LSE atomics back.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../launcher/session/ComponentsManager.kt     |   4 +
+ .../session/Armv80ProtonComponentsTest.kt     |  32 +++++
+ .../usr/local/bin/droiddeck-proton-armv80     | 110 ++++++++++----
+ tools/tests/test_armv80_install_base.py       | 136 ++++++++++++++++++
+ 4 files changed, 258 insertions(+), 24 deletions(-)
+ create mode 100644 app/src/test/java/com/droiddeck/launcher/session/Armv80ProtonComponentsTest.kt
+ create mode 100644 tools/tests/test_armv80_install_base.py
+
+diff --git a/app/src/main/java/com/droiddeck/launcher/session/ComponentsManager.kt b/app/src/main/java/com/droiddeck/launcher/session/ComponentsManager.kt
+index e9409b7..af73f21 100644
+--- a/app/src/main/java/com/droiddeck/launcher/session/ComponentsManager.kt
++++ b/app/src/main/java/com/droiddeck/launcher/session/ComponentsManager.kt
+@@ -45,6 +45,7 @@ object ComponentsManager {
+     val LABEL = mapOf("fex" to "FEX", "dxvk" to "DXVK", "vkd3d" to "VKD3D-Proton")
+ 
+     private const val WINE = "files/lib/wine"
++    private const val ARMV80_MARK = ".droiddeck-armv80"
+     private val FEX_FILES = listOf(
+         "$WINE/aarch64-windows/libarm64ecfex.dll",
+         "$WINE/aarch64-windows/libwow64fex.dll",
+@@ -291,6 +292,9 @@ object ComponentsManager {
+             val entries = base.listFiles()?.sortedBy { it.name } ?: continue
+             for (dir in entries) {
+                 if (!File(dir, WINE).isDirectory || !File(dir, "proton").isFile) continue
++                // droiddeck-proton-armv80's build for CPUs without LSE atomics: its DLLs were rewritten to run there, and
++                // any DXVK, vkd3d-proton or FEX build swapped in (or kept up to date) would bring the atomics back.
++                if (File(dir, ARMV80_MARK).isFile) continue
+                 val real = runCatching { dir.canonicalPath }.getOrDefault(dir.path)
+                 if (found.containsKey(real)) continue
+                 val guest = if (dir.absolutePath.startsWith(rootPath)) dir.absolutePath.removePrefix(rootPath) else dir.absolutePath
+diff --git a/app/src/test/java/com/droiddeck/launcher/session/Armv80ProtonComponentsTest.kt b/app/src/test/java/com/droiddeck/launcher/session/Armv80ProtonComponentsTest.kt
+new file mode 100644
+index 0000000..fd09b01
+--- /dev/null
++++ b/app/src/test/java/com/droiddeck/launcher/session/Armv80ProtonComponentsTest.kt
+@@ -0,0 +1,32 @@
++package com.droiddeck.launcher.session
++
++import android.content.Context
++import com.droiddeck.launcher.runtime.LinuxRuntime
++import org.junit.Assert.assertEquals
++import org.junit.Test
++import org.junit.runner.RunWith
++import org.robolectric.RobolectricTestRunner
++import org.robolectric.RuntimeEnvironment
++import org.robolectric.annotation.Config
++import java.io.File
++
++/** The ARMv8.0 build of DroidDeck-Proton (droiddeck-proton-armv80) is never offered for component swaps or kept up to
++ *  date: its DLLs were rewritten for CPUs without LSE atomics, and a swapped-in DXVK, vkd3d-proton or FEX build would
++ *  bring them back. The release it is made from, which the component updates do change, stays listed. */
++@RunWith(RobolectricTestRunner::class)
++@Config(sdk = [28], manifest = Config.NONE)
++class Armv80ProtonComponentsTest {
++    @Test fun theArmv80BuildIsNotListedForComponents() {
++        val context: Context = RuntimeEnvironment.getApplication()
++        val root = LinuxRuntime.rootDir(context)
++        root.deleteRecursively()
++        val tools = File(root, "root/.local/share/Steam/compatibilitytools.d")
++        for (name in listOf("DroidDeck-Proton 11-12.8", "ARMv8.0-DroidDeck-Proton-11-12.8")) {
++            File(tools, "$name/files/lib/wine").mkdirs()
++            File(tools, "$name/proton").writeText("# test Proton\n")
++        }
++        File(tools, "ARMv8.0-DroidDeck-Proton-11-12.8/.droiddeck-armv80").writeText("patch sha256\n")
++
++        assertEquals(listOf("DroidDeck-Proton 11-12.8"), ComponentsManager.protons(context).map { it.dir.name })
++    }
++}
+diff --git a/tools/linuxfs/overlay/usr/local/bin/droiddeck-proton-armv80 b/tools/linuxfs/overlay/usr/local/bin/droiddeck-proton-armv80
+index b7fba77..3d82372 100755
+--- a/tools/linuxfs/overlay/usr/local/bin/droiddeck-proton-armv80
++++ b/tools/linuxfs/overlay/usr/local/bin/droiddeck-proton-armv80
+@@ -5,6 +5,9 @@ Every arm64 Proton build uses LSE atomics with no runtime check, so it stops wit
+ CPU. This takes the pinned upstream release, verifies it, and applies a patch made by DroidDeck's
+ tools/armv80/rewrite_tree.py: each LSE instruction branches to an equivalent load/store-exclusive
+ sequence. Every patched file is checked against the sha256 of the original and of the result.
++An installed DroidDeck-Proton 11-12.8 is used as the base (no download) only while the files the patch rewrites are
++still the release's own: DroidDeck's component updates replace some of them (vkd3d-proton's d3d12.dll, DXVK, FEX's
++DLLs) in that tree, and then the verified release is downloaded instead, once.
+ 
+     droiddeck-proton-armv80 <steam root>          install when missing; prints the tool name
+     droiddeck-proton-armv80 <steam root> --name   print the tool name if it is installed
+@@ -94,12 +97,36 @@ def read_patch(path):
+     return entries
+ 
+ 
++class Mismatch(Exception):
++    """A file is not the release's own, so the patch cannot be applied to it."""
++
++
++# What DroidDeck's component manager swaps inside a DroidDeck-Proton tree it keeps up to date (DXVK, vkd3d-proton and
++# FEX's arm64ec/wow64 DLLs). A phone's log: the installed release was copied (2 GB, 32 s) and then
++# "files/lib/wine/vkd3d-proton/aarch64-windows/d3d12.dll is not the file the patch was made for", at every start.
++SWAPPED = frozenset(("d3d8.dll", "d3d9.dll", "d3d10core.dll", "d3d11.dll", "dxgi.dll", "d3d12.dll", "d3d12core.dll",
++                     "libarm64ecfex.dll", "libwow64fex.dll"))
++
++
++def changed_file(tree, entries, only=None):
++    """The first file the patch rewrites that is not the release's own (or is missing), else None."""
++    for name, before, _after, _size, _runs in entries:
++        if only is not None and os.path.basename(name) not in only:
++            continue
++        try:
++            if bytes.fromhex(sha256_file(os.path.join(tree, name))) != before:
++                return name
++        except OSError:
++            return name
++    return None
++
++
+ def apply(tree, entries):
+     for name, before, after, size, runs in entries:
+         path = os.path.join(tree, name)
+         data = bytearray(open(path, "rb").read())
+         if hashlib.sha256(data).digest() != before:
+-            raise SystemExit("droiddeck-proton-armv80: %s is not the file the patch was made for" % name)
++            raise Mismatch(name)
+         if len(data) < size:
+             data += b"\0" * (size - len(data))
+         del data[size:]
+@@ -125,6 +152,36 @@ def rename_tool(tree):
+     open(path, "w", encoding="utf-8").write(text)
+ 
+ 
++def note_changed(note, name):
++    """Remembered until the install succeeds, so a changed base is not copied again at every start."""
++    step("the installed %s has %s replaced (by a component update): installing the ARMv8.0 version from the original "
++         "release instead (626 MB download, once)" % (RELEASE, os.path.basename(name)))
++    with open(note, "w") as f:
++        f.write(name + "\n")
++
++
++def unpack_release(staging, tree):
++    """The pinned upstream release, downloaded (resuming), checked and unpacked to `tree`."""
++    tarball = os.path.join(staging, "DroidDeck-Proton-11-12.8-aarch64.tar.gz")
++    if not (os.path.isfile(tarball) and sha256_file(tarball) == SHA256):
++        log("downloading %s (626 MB, once; a partial download resumes)" % RELEASE)
++        rc = download(URL, tarball)
++        if rc != 0:
++            raise SystemExit("droiddeck-proton-armv80: download failed (curl %d)" % rc)
++        if sha256_file(tarball) != SHA256:
++            os.unlink(tarball)
++            raise SystemExit("droiddeck-proton-armv80: the download did not match its checksum")
++    step("unpacking DroidDeck-Proton 11-12.8 (a few minutes)")
++    unpacked = os.path.join(staging, "unpacked")
++    shutil.rmtree(unpacked, ignore_errors=True)
++    os.makedirs(unpacked)
++    if subprocess.call(["tar", "-xf", tarball, "-C", unpacked]) != 0:
++        raise SystemExit("droiddeck-proton-armv80: tar failed")
++    os.rename(os.path.join(unpacked, RELEASE), tree)
++    shutil.rmtree(unpacked, ignore_errors=True)
++    os.unlink(tarball)
++
++
+ def main():
+     if len(sys.argv) < 2:
+         raise SystemExit(__doc__)
+@@ -151,31 +208,36 @@ def main():
+     shutil.rmtree(tree, ignore_errors=True)
+     entries = read_patch(PATCH)
+     base = os.path.join(tools, RELEASE)
+-    if os.path.isfile(os.path.join(base, "toolmanifest.vdf")) and \
+-            all(os.path.isfile(os.path.join(base, e[0])) for e in entries):
++    changed_note = os.path.join(staging, "base-changed")
++    use_base = os.path.isfile(os.path.join(base, "toolmanifest.vdf")) and \
++        all(os.path.isfile(os.path.join(base, e[0])) for e in entries)
++    if use_base and os.path.isfile(changed_note):
++        use_base = False
++        log("the installed %s was found changed before (%s): using the original release"
++            % (RELEASE, open(changed_note).read().strip()))
++    elif use_base:
++        changed = changed_file(base, entries, SWAPPED)
++        if changed:
++            use_base = False
++            note_changed(changed_note, changed)
++    if use_base:
+         log("using the installed %s as the base" % RELEASE)
+         shutil.copytree(base, tree, symlinks=True)
+-    else:
+-        tarball = os.path.join(staging, "DroidDeck-Proton-11-12.8-aarch64.tar.gz")
+-        if not (os.path.isfile(tarball) and sha256_file(tarball) == SHA256):
+-            log("downloading %s (626 MB, once; a partial download resumes)" % RELEASE)
+-            rc = download(URL, tarball)
+-            if rc != 0:
+-                raise SystemExit("droiddeck-proton-armv80: download failed (curl %d)" % rc)
+-            if sha256_file(tarball) != SHA256:
+-                os.unlink(tarball)
+-                raise SystemExit("droiddeck-proton-armv80: the download did not match its checksum")
+-        step("unpacking DroidDeck-Proton 11-12.8 (a few minutes)")
+-        unpacked = os.path.join(staging, "unpacked")
+-        shutil.rmtree(unpacked, ignore_errors=True)
+-        os.makedirs(unpacked)
+-        if subprocess.call(["tar", "-xf", tarball, "-C", unpacked]) != 0:
+-            raise SystemExit("droiddeck-proton-armv80: tar failed")
+-        os.rename(os.path.join(unpacked, RELEASE), tree)
+-        shutil.rmtree(unpacked, ignore_errors=True)
+-        os.unlink(tarball)
+-    step("installing DroidDeck-Proton 11-12.8 for ARMv8.0: rewriting %d files" % len(entries))
+-    apply(tree, entries)
++        step("installing DroidDeck-Proton 11-12.8 for ARMv8.0: rewriting %d files" % len(entries))
++        try:
++            apply(tree, entries)
++        except Mismatch as e:
++            note_changed(changed_note, str(e))
++            shutil.rmtree(tree, ignore_errors=True)
++            use_base = False
++    if not use_base:
++        unpack_release(staging, tree)
++        step("installing DroidDeck-Proton 11-12.8 for ARMv8.0: rewriting %d files" % len(entries))
++        try:
++            apply(tree, entries)
++        except Mismatch as e:
++            raise SystemExit("droiddeck-proton-armv80: %s is not the file the patch was made for, even in the "
++                             "verified release" % e)
+     rename_tool(tree)
+     with open(os.path.join(tree, MARK), "w") as f:
+         f.write(want + "\n")
+diff --git a/tools/tests/test_armv80_install_base.py b/tools/tests/test_armv80_install_base.py
+new file mode 100644
+index 0000000..515a25f
+--- /dev/null
++++ b/tools/tests/test_armv80_install_base.py
+@@ -0,0 +1,136 @@
++"""droiddeck-proton-armv80 with an installed DroidDeck-Proton 11-12.8 that DroidDeck's component updates changed.
++
++A Snapdragon 685's log (DroidDeck-2026-11-21-01-steam.zip): the installed release was copied as the base, 2 GB in
++32 s, and then "files/lib/wine/vkd3d-proton/aarch64-windows/d3d12.dll is not the file the patch was made for", so
++the ARMv8.0 build was never installed and the same copy failed again at every start. Now a changed base is noticed
++before the copy (for what the component manager swaps) or after it (anything else), the verified release is used
++instead, and a changed base is not copied again."""
++import hashlib
++import os
++from pathlib import Path
++import struct
++import subprocess
++import sys
++import tarfile
++import tempfile
++import unittest
++import zlib
++
++INSTALLER = Path(__file__).resolve().parents[1] / 'linuxfs/overlay/usr/local/bin/droiddeck-proton-armv80'
++RELEASE = 'DroidDeck-Proton 11-12.8'
++D3D12 = 'files/lib/wine/vkd3d-proton/aarch64-windows/d3d12.dll'
++KERNEL32 = 'files/lib/wine/aarch64-windows/kernel32.dll'
++ORIGINAL = {D3D12: b'MZ vkd3d-proton 2.14 d3d12 ' * 40, KERNEL32: b'MZ wine kernel32 ' * 60}
++PATCHED = {name: data[:8] + b'LLSC' + data[12:] for name, data in ORIGINAL.items()}
++VDF = '"compatibilitytools"\n{\n  "compat_tools"\n  {\n    "DroidDeck-Proton-11-12.8"\n    {\n      "install_path" "."\n' \
++      '      "display_name" "DroidDeck-Proton 11-12.8"\n      "from_oslist" "windows"\n      "to_oslist" "linux"\n    }\n  }\n}\n'
++
++RUN = r'''
++import runpy, sys
++g = runpy.run_path(sys.argv[1])["main"].__globals__
++g.update(URL=sys.argv[2], SHA256=sys.argv[3], PATCH=sys.argv[4], NEED_BYTES=0)
++sys.argv = ["droiddeck-proton-armv80", sys.argv[5]]
++g["main"]()
++'''
++
++
++def patch_file(path):
++    body = b''
++    for name in (D3D12, KERNEL32):
++        before, after = ORIGINAL[name], PATCHED[name]
++        body += struct.pack('<H', len(name)) + name.encode()
++        body += hashlib.sha256(before).digest() + hashlib.sha256(after).digest()
++        body += struct.pack('<QI', len(after), 1) + struct.pack('<QI', 8, 4) + b'LLSC'
++    path.write_bytes(b'LSE80PATCH1\n' + struct.pack('<I', 2) + zlib.compress(body))
++
++
++def release_tree(root, changes=None):
++    tree = root / RELEASE
++    for name, data in ORIGINAL.items():
++        (tree / name).parent.mkdir(parents=True, exist_ok=True)
++        (tree / name).write_bytes((changes or {}).get(name, data))
++    (tree / 'toolmanifest.vdf').write_text('"manifest"\n{\n  "commandline" "/proton %verb%"\n}\n')
++    (tree / 'compatibilitytool.vdf').write_text(VDF)
++    (tree / 'proton').write_text('#!/usr/bin/env python3\n')
++    return tree
++
++
++class InstallFromChangedBaseTest(unittest.TestCase):
++    def setUp(self):
++        self.tmp = tempfile.TemporaryDirectory()
++        root = Path(self.tmp.name)
++        self.steam = root / 'Steam'
++        self.tools = self.steam / 'compatibilitytools.d'
++        self.tools.mkdir(parents=True)
++        self.patch = root / 'proton.lse80'
++        patch_file(self.patch)
++        pristine = root / 'pristine'
++        pristine.mkdir()
++        release_tree(pristine)
++        self.tarball = root / 'DroidDeck-Proton-11-12.8-aarch64.tar.gz'
++        with tarfile.open(self.tarball, 'w:gz') as tar:
++            tar.add(pristine / RELEASE, arcname=RELEASE)
++        self.sha = hashlib.sha256(self.tarball.read_bytes()).hexdigest()
++        self.url = self.tarball.as_uri()
++
++    def tearDown(self):
++        self.tmp.cleanup()
++
++    def install(self, url=None):
++        return subprocess.run([sys.executable, '-c', RUN, str(INSTALLER), url or self.url, self.sha, str(self.patch),
++                               str(self.steam)], capture_output=True, text=True, timeout=120)
++
++    def installed(self):
++        tree = self.tools / 'ARMv8.0-DroidDeck-Proton-11-12.8'
++        self.assertTrue((tree / '.droiddeck-armv80').is_file())
++        for name, data in PATCHED.items():
++            self.assertEqual((tree / name).read_bytes(), data, name)
++        self.assertIn('droiddeck-proton-11-12.8-armv80', (tree / 'compatibilitytool.vdf').read_text())
++
++    def test_a_base_with_a_dll_a_component_update_replaced_is_not_copied(self):
++        base = release_tree(self.tools, {D3D12: b'MZ vkd3d-proton 2.15 nightly'})
++        result = self.install()
++        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
++        self.assertIn('has d3d12.dll replaced (by a component update)', result.stdout)
++        self.assertNotIn('using the installed', result.stdout)
++        self.installed()
++        self.assertEqual((base / D3D12).read_bytes(), b'MZ vkd3d-proton 2.15 nightly')   # the user's tool is left alone
++        self.assertFalse((self.tools / '.droiddeck-armv80').exists())
++
++    def test_any_other_change_found_while_patching_falls_back_to_the_release_in_the_same_start(self):
++        release_tree(self.tools, {KERNEL32: b'MZ wine kernel32 rebuilt'})
++        result = self.install()
++        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
++        self.assertIn('using the installed', result.stdout)
++        self.assertIn('has kernel32.dll replaced', result.stdout)
++        self.installed()
++
++    def test_an_unchanged_base_is_used_without_downloading(self):
++        release_tree(self.tools)
++        result = self.install(url=(self.tarball.parent / 'missing.tar.gz').as_uri())
++        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
++        self.assertIn('using the installed', result.stdout)
++        self.installed()
++
++    def test_a_changed_base_is_not_copied_again_after_a_failed_download(self):
++        release_tree(self.tools, {KERNEL32: b'MZ wine kernel32 rebuilt'})
++        missing = (self.tarball.parent / 'missing.tar.gz').as_uri()
++        first = self.install(url=missing)
++        self.assertNotEqual(first.returncode, 0)
++        self.assertIn('download failed', first.stderr)
++        second = self.install(url=missing)
++        self.assertIn('was found changed before (files/lib/wine/aarch64-windows/kernel32.dll)', second.stdout)
++        self.assertNotIn('using the installed', second.stdout)
++        third = self.install()
++        self.assertEqual(third.returncode, 0, third.stdout + third.stderr)
++        self.installed()
++
++    def test_an_installed_armv80_build_is_reported_without_work(self):
++        release_tree(self.tools)
++        self.assertEqual(self.install().returncode, 0)
++        again = self.install(url=(self.tarball.parent / 'missing.tar.gz').as_uri())
++        self.assertEqual(again.stdout.strip(), 'droiddeck-proton-11-12.8-armv80')
++
++
++if __name__ == '__main__':
++    unittest.main()
+-- 
+2.43.0
+
