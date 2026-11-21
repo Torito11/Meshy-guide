@@ -1,0 +1,491 @@
+From 0c05f5cf8e7980ad0d6e0c7ce7aa13d85273ba17 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 21 Nov 2026 14:55:33 +0000
+Subject: [PATCH 13/16] fix(steam): watch the x86-64 client until its first
+ frame and recover
+
+On an ARMv8.0 CPU the Steam menus are drawn by an x86 steamwebhelper
+under FEX through FEX's GL thunks. When its GPU process keeps failing,
+Chromium gives up ("GPU process isn't usable") and the screen stays
+empty for good: the session sat on "Waiting for Steam's first frame"
+with nothing explaining why. droiddeck-steam-x64 already noticed this
+but only logged it.
+
+Until the app reports the session's first frame (it now writes
+~/.bl-first-frame), a watch beside the client:
+- restarts the client once with software rendering when the GPU
+  renderer gives up, and remembers that for this client build (a new
+  build tries the GPU again);
+- restarts it the same way when it has done nothing for 3 minutes
+  (after 5) on the GPU renderer, and only reports it in software mode;
+- says every 30 s how long it has been starting, the client's CPU use,
+  free memory, whether the bootstrapper is updating or verifying, and a
+  missing library if a web helper could not load one.
+The session restarts the client at most once for this. The loading
+screen shows these steps in the app's language.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../com/droiddeck/launcher/SessionActivity.kt |   2 +
+ .../launcher/session/LoadingState.kt          |  31 ++++-
+ app/src/main/res/values-b+es+419/strings.xml  |  11 ++
+ app/src/main/res/values-es/strings.xml        |  11 ++
+ app/src/main/res/values/strings.xml           |  11 ++
+ .../session/LoadingStepExplainedTest.kt       |  45 +++++++
+ .../overlay/usr/local/bin/droiddeck-session   |  12 ++
+ .../overlay/usr/local/bin/droiddeck-steam-x64 | 101 ++++++++++++++++
+ tools/tests/test_steam_first_frame_watch.py   | 112 ++++++++++++++++++
+ 9 files changed, 335 insertions(+), 1 deletion(-)
+ create mode 100644 app/src/test/java/com/droiddeck/launcher/session/LoadingStepExplainedTest.kt
+ create mode 100644 tools/tests/test_steam_first_frame_watch.py
+
+diff --git a/app/src/main/java/com/droiddeck/launcher/SessionActivity.kt b/app/src/main/java/com/droiddeck/launcher/SessionActivity.kt
+index 873cf93..fd7f78d 100644
+--- a/app/src/main/java/com/droiddeck/launcher/SessionActivity.kt
++++ b/app/src/main/java/com/droiddeck/launcher/SessionActivity.kt
+@@ -5362,6 +5362,8 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
+     private val endListener: (Int) -> Unit = { status -> onSessionEnded(status) }
+     private val firstFrameListener = Runnable {
+         SessionEvents.firstFrame()
++        // droiddeck-steam-x64 watches for this while the client starts (see x64_first_frame_watch).
++        runCatching { File(LinuxRuntime.rootDir(this), "root/.bl-first-frame").writeText("${System.currentTimeMillis()}\n") }
+         if (SessionState.mode == SessionService.MODE_STEAM) SteamRepair.clientShown(this)
+         runOnUiThread {
+             if (isFinishing || isDestroyed) return@runOnUiThread
+diff --git a/app/src/main/java/com/droiddeck/launcher/session/LoadingState.kt b/app/src/main/java/com/droiddeck/launcher/session/LoadingState.kt
+index 7487b98..11e3b98 100644
+--- a/app/src/main/java/com/droiddeck/launcher/session/LoadingState.kt
++++ b/app/src/main/java/com/droiddeck/launcher/session/LoadingState.kt
+@@ -118,7 +118,10 @@ class LoadingState(context: Context, private val steam: Boolean = true) {
+                 context.getString(com.droiddeck.launcher.R.string.loadstate_steam_client, clientDownload), clientPercent,
+                 Topic.STEAM, readable = true,
+             )
+-            stepText != null -> Line(stepText, -1, topicOf(stepText, steam), readableScriptStep(stepText))
++            stepText != null -> {
++                val explained = explainedStep(res, stepText)
++                Line(explained ?: stepText, -1, topicOf(stepText, steam), explained != null || readableScriptStep(stepText))
++            }
+             else -> null
+         }
+     }
+@@ -151,6 +154,32 @@ class LoadingState(context: Context, private val steam: Boolean = true) {
+             return count.groupValues[1] to (part.toLong() * 100 / maxOf(1, all)).coerceIn(0L, 100L).toInt()
+         }
+ 
++        /** The steps that explain a slow or failing Steam start (droiddeck-steam-x64's first-frame watch and the
++         *  ARMv8.0 preparation), in the app's language; null for any other step. */
++        internal fun explainedStep(res: android.content.res.Resources, scriptStep: String): String? {
++            BUSY.find(scriptStep)?.let { m ->
++                val seconds = m.groupValues[1].toInt()
++                val parts = mutableListOf(res.getString(com.droiddeck.launcher.R.string.loadstate_steam_busy, seconds / 60, seconds % 60, m.groupValues[2].toInt()))
++                m.groupValues[3].toIntOrNull()?.let { parts += res.getString(com.droiddeck.launcher.R.string.loadstate_free_memory, it) }
++                if (m.groupValues[4].isNotEmpty()) parts += res.getString(com.droiddeck.launcher.R.string.loadstate_steam_verifying)
++                if (m.groupValues[5].isNotEmpty()) parts += res.getString(com.droiddeck.launcher.R.string.loadstate_missing_library, m.groupValues[5])
++                return parts.joinToString(" · ")
++            }
++            GPU_FAILED.find(scriptStep)?.let { return res.getString(com.droiddeck.launcher.R.string.loadstate_steam_gpu_failed, it.groupValues[1].toInt()) }
++            STALLED_RESTART.find(scriptStep)?.let { return res.getString(com.droiddeck.launcher.R.string.loadstate_steam_stalled_restart, it.groupValues[1].toInt()) }
++            STALLED.find(scriptStep)?.let { return res.getString(com.droiddeck.launcher.R.string.loadstate_steam_stalled, it.groupValues[1].toInt()) }
++            if (scriptStep.startsWith("steam's menus use software rendering")) return res.getString(com.droiddeck.launcher.R.string.loadstate_steam_software)
++            if (scriptStep.startsWith("the Steam client is now build")) return res.getString(com.droiddeck.launcher.R.string.loadstate_steam_gpu_retry)
++            if (scriptStep.startsWith("checking Proton for this CPU")) return res.getString(com.droiddeck.launcher.R.string.loadstate_proton_armv80)
++            if (scriptStep.startsWith("checking the x86-64 Steam client")) return res.getString(com.droiddeck.launcher.R.string.loadstate_steam_x64_check)
++            return null
++        }
++
++        private val BUSY = Regex("""^steam is still starting: (\d+) s, client cpu (\d+)%(?:, (\d+) MB free)?(, updating or verifying)?(?:, missing library (\S+))?""")
++        private val GPU_FAILED = Regex("""^steam's menus failed on the GPU \((\d+) GPU process exits\)""")
++        private val STALLED_RESTART = Regex("""^steam has done nothing for (\d+) s and shows no image: restarting""")
++        private val STALLED = Regex("""^steam has done nothing for (\d+) s and shows no image""")
++
+         internal fun readableScriptStep(scriptStep: String): Boolean {
+             val t = scriptStep.lowercase()
+             return t.startsWith("download") || t.startsWith("checking the linux") || t.startsWith("unpacking") || t.startsWith("installing")
+diff --git a/app/src/main/res/values-b+es+419/strings.xml b/app/src/main/res/values-b+es+419/strings.xml
+index 825f070..7284045 100644
+--- a/app/src/main/res/values-b+es+419/strings.xml
++++ b/app/src/main/res/values-b+es+419/strings.xml
+@@ -2081,6 +2081,17 @@
+     <string name="loadstate_elapsed">%1$d:%2$02d transcurridos · sigue en marcha</string>
+     <string name="loadstate_steam_update">Descargando la actualización del cliente de Steam · %1$d%%</string>
+     <string name="loadstate_steam_client">Descargando el cliente de Steam · %1$s</string>
++    <string name="loadstate_steam_busy">Steam sigue arrancando · %1$d:%2$02d · CPU del cliente %3$d %%</string>
++    <string name="loadstate_free_memory">%1$d MB libres</string>
++    <string name="loadstate_steam_verifying">actualizando o comprobando sus archivos</string>
++    <string name="loadstate_missing_library">falta la biblioteca %1$s</string>
++    <string name="loadstate_steam_gpu_failed">Los menús de Steam fallaron con la GPU (%1$d errores): reiniciando Steam con renderizado por software</string>
++    <string name="loadstate_steam_stalled_restart">Steam lleva %1$d s sin hacer nada y sin imagen: reiniciándolo con renderizado por software</string>
++    <string name="loadstate_steam_stalled">Steam lleva %1$d s sin hacer nada y sin imagen. Aún puede recuperarse; si no, comparte los registros</string>
++    <string name="loadstate_steam_software">Los menús de Steam usan renderizado por software en este dispositivo (la GPU falló antes): más lento, pero se muestran</string>
++    <string name="loadstate_steam_gpu_retry">El cliente de Steam se actualizó: se vuelve a probar la GPU para sus menús</string>
++    <string name="loadstate_proton_armv80">Preparando Proton para esta CPU (ARMv8.0). La primera vez descarga 626 MB y tarda unos minutos</string>
++    <string name="loadstate_steam_x64_check">Comprobando el cliente de Steam x86-64 (la primera vez descarga unos 2 GB)</string>
+     <string name="pextra_busy">Ya se está instalando una herramienta de compatibilidad</string>
+     <string name="pextra_stop_session">Detén la sesión activa antes de instalar herramientas de compatibilidad</string>
+     <string name="pextra_no_release">No se encontró una versión ARM64 de %1$s</string>
+diff --git a/app/src/main/res/values-es/strings.xml b/app/src/main/res/values-es/strings.xml
+index 64e90df..585d439 100644
+--- a/app/src/main/res/values-es/strings.xml
++++ b/app/src/main/res/values-es/strings.xml
+@@ -2026,6 +2026,17 @@
+     <string name="loadstate_elapsed">%1$d:%2$02d transcurridos · sigue en marcha</string>
+     <string name="loadstate_steam_update">Descargando la actualización del cliente de Steam · %1$d%%</string>
+     <string name="loadstate_steam_client">Descargando el cliente de Steam · %1$s</string>
++    <string name="loadstate_steam_busy">Steam sigue arrancando · %1$d:%2$02d · CPU del cliente %3$d %%</string>
++    <string name="loadstate_free_memory">%1$d MB libres</string>
++    <string name="loadstate_steam_verifying">actualizando o comprobando sus archivos</string>
++    <string name="loadstate_missing_library">falta la biblioteca %1$s</string>
++    <string name="loadstate_steam_gpu_failed">Los menús de Steam fallaron con la GPU (%1$d errores): reiniciando Steam con renderizado por software</string>
++    <string name="loadstate_steam_stalled_restart">Steam lleva %1$d s sin hacer nada y sin imagen: reiniciándolo con renderizado por software</string>
++    <string name="loadstate_steam_stalled">Steam lleva %1$d s sin hacer nada y sin imagen. Aún puede recuperarse; si no, comparte los registros</string>
++    <string name="loadstate_steam_software">Los menús de Steam usan renderizado por software en este dispositivo (la GPU falló antes): más lento, pero se muestran</string>
++    <string name="loadstate_steam_gpu_retry">El cliente de Steam se actualizó: se vuelve a probar la GPU para sus menús</string>
++    <string name="loadstate_proton_armv80">Preparando Proton para esta CPU (ARMv8.0). La primera vez descarga 626 MB y tarda unos minutos</string>
++    <string name="loadstate_steam_x64_check">Comprobando el cliente de Steam x86-64 (la primera vez descarga unos 2 GB)</string>
+ 
+     <string name="pextra_busy">Ya se está instalando una herramienta de compatibilidad</string>
+     <string name="pextra_stop_session">Detén la sesión activa antes de instalar herramientas de compatibilidad</string>
+diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
+index 821fcc9..9a990a4 100644
+--- a/app/src/main/res/values/strings.xml
++++ b/app/src/main/res/values/strings.xml
+@@ -2208,6 +2208,17 @@
+     <string name="loadstate_steam_update">Downloading the Steam client update · %1$d%%</string>
+     <string name="loadstate_steam_update_applying">Applying the Steam client update…</string>
+     <string name="loadstate_steam_client">Downloading the Steam client · %1$s</string>
++    <string name="loadstate_steam_busy">Steam is still starting · %1$d:%2$02d · client CPU %3$d%%</string>
++    <string name="loadstate_free_memory">%1$d MB free</string>
++    <string name="loadstate_steam_verifying">updating or checking its files</string>
++    <string name="loadstate_missing_library">missing library %1$s</string>
++    <string name="loadstate_steam_gpu_failed">Steam\'s menus failed on the GPU (%1$d errors): starting Steam again with software rendering</string>
++    <string name="loadstate_steam_stalled_restart">Steam did nothing for %1$d s and shows no image: starting it again with software rendering</string>
++    <string name="loadstate_steam_stalled">Steam did nothing for %1$d s and shows no image. It may still recover; if not, share the logs</string>
++    <string name="loadstate_steam_software">Steam\'s menus use software rendering on this device (the GPU renderer failed before): slower, but they show</string>
++    <string name="loadstate_steam_gpu_retry">The Steam client was updated: trying the GPU renderer for its menus again</string>
++    <string name="loadstate_proton_armv80">Preparing Proton for this CPU (ARMv8.0). The first time it downloads 626 MB and takes a few minutes</string>
++    <string name="loadstate_steam_x64_check">Checking the x86-64 Steam client (the first run downloads about 2 GB)</string>
+ 
+     <string name="pextra_busy">A compatibility tool install is already running</string>
+     <string name="pextra_stop_session">Stop the active session before installing compatibility tools</string>
+diff --git a/app/src/test/java/com/droiddeck/launcher/session/LoadingStepExplainedTest.kt b/app/src/test/java/com/droiddeck/launcher/session/LoadingStepExplainedTest.kt
+new file mode 100644
+index 0000000..9fec5c1
+--- /dev/null
++++ b/app/src/test/java/com/droiddeck/launcher/session/LoadingStepExplainedTest.kt
+@@ -0,0 +1,45 @@
++package com.droiddeck.launcher.session
++
++import android.app.Application
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertNull
++import org.junit.Assert.assertTrue
++import org.junit.Test
++import org.robolectric.RuntimeEnvironment
++
++/** The steps droiddeck-steam-x64's first-frame watch writes are shown, in the app's language, instead of the
++ *  generic "Waiting for Steam's first frame". */
++@org.junit.runner.RunWith(org.robolectric.RobolectricTestRunner::class)
++@org.robolectric.annotation.Config(sdk = [33], application = Application::class)
++class LoadingStepExplainedTest {
++    private val res get() = RuntimeEnvironment.getApplication().resources
++
++    @Test fun aBusyClientShowsTimeCpuMemoryAndActivity() {
++        val text = LoadingState.explainedStep(res, "steam is still starting: 125 s, client cpu 87%, 2310 MB free, updating or verifying")!!
++        assertTrue(text, text.startsWith("Steam is still starting · 2:05 · client CPU 87%"))
++        assertTrue(text, "2310 MB free" in text)
++        assertTrue(text, "updating or checking its files" in text)
++    }
++
++    @Test fun aMissingLibraryIsNamed() {
++        val text = LoadingState.explainedStep(res, "steam is still starting: 40 s, client cpu 0%, missing library libnss3.so")!!
++        assertTrue(text, "missing library libnss3.so" in text)
++    }
++
++    @Test fun recoveryAndFailureStepsAreExplained() {
++        assertEquals("Steam's menus failed on the GPU (3 errors): starting Steam again with software rendering",
++            LoadingState.explainedStep(res, "steam's menus failed on the GPU (3 GPU process exits): restarting Steam with software rendering"))
++        assertTrue(LoadingState.explainedStep(res, "steam has done nothing for 180 s and shows no image: restarting Steam with software rendering")!!
++            .contains("starting it again with software rendering"))
++        assertTrue(LoadingState.explainedStep(res, "steam has done nothing for 180 s and shows no image: share the logs from the menu")!!
++            .contains("share the logs"))
++        assertTrue(LoadingState.explainedStep(res, "steam's menus use software rendering on this device: the GPU renderer failed")!!
++            .contains("software rendering"))
++        assertTrue(LoadingState.explainedStep(res, "checking Proton for this CPU (ARMv8.0; the first time downloads 626 MB)")!!.contains("626 MB"))
++    }
++
++    @Test fun otherStepsKeepTheirText() {
++        assertNull(LoadingState.explainedStep(res, "starting the Steam client"))
++        assertNull(LoadingState.explainedStep(res, "x86-64 Steam client ready"))
++    }
++}
+diff --git a/tools/linuxfs/overlay/usr/local/bin/droiddeck-session b/tools/linuxfs/overlay/usr/local/bin/droiddeck-session
+index ee9b139..aedff6a 100755
+--- a/tools/linuxfs/overlay/usr/local/bin/droiddeck-session
++++ b/tools/linuxfs/overlay/usr/local/bin/droiddeck-session
+@@ -11,6 +11,9 @@ if [ "${BL_RAISE_NOFILE:-0}" = 1 ] && [ -z "${BL_INSIDE:-}" ]; then
+   unset bl_nofile_was
+ fi
+ export HOME=${HOME:-/root}
++# The app writes .bl-first-frame when the compositor draws this session's first frame; droiddeck-steam-x64
++# watches for it while the client starts (and leaves .bl-restart-software when it restarts the client).
++[ -z "${BL_INSIDE:-}" ] && rm -f "$HOME/.bl-first-frame" "$HOME/.bl-restart-software"
+ mode=${1:-desktop}
+ shift || true
+ step() { echo "== STEP $(date -u +%H:%M:%S.%3N) $*"; }
+@@ -1937,6 +1940,15 @@ case $mode in
+         set --
+         continue
+       fi
++      if [ -f "$HOME/.bl-restart-software" ]; then
++        rm -f "$HOME/.bl-restart-software"
++        if [ -z "${_bl_x64_software:-}" ]; then
++          _bl_x64_software=1
++          echo "== steam: starting the client again with software rendering for its menus"
++          set --
++          continue
++        fi
++      fi
+       if [ "$steam_x64" = 1 ] && [ "$rc" -eq 132 ] && [ -z "${_bl_x64_sigill:-}" ]; then
+         _bl_x64_sigill=1
+         echo "== steam: the x86-64 client stopped on an illegal instruction after it updated itself; starting it again once"
+diff --git a/tools/linuxfs/overlay/usr/local/bin/droiddeck-steam-x64 b/tools/linuxfs/overlay/usr/local/bin/droiddeck-steam-x64
+index 361f962..95ea556 100755
+--- a/tools/linuxfs/overlay/usr/local/bin/droiddeck-steam-x64
++++ b/tools/linuxfs/overlay/usr/local/bin/droiddeck-steam-x64
+@@ -882,7 +882,102 @@ x64_arm_webhelper_cpu_supported() {
+ # Valve's arm64 client, web helper and every arm64 Proton build need the same LSE atomics.
+ x64_arm64_builds_supported() { x64_arm_webhelper_cpu_supported; }
+ 
++x64_client_build() {
++  local chan
++  chan=$(cat "$STEAM_X64/package/beta" 2>/dev/null || echo "$X64_CHANNEL")
++  awk -F'"' '$2 == "version" { print $4; exit }' "$STEAM_X64/package/steam_client_${chan}_steamrt64.manifest" 2>/dev/null
++}
++
++# CPU time (clock ticks) of the client and its web helpers, all FEX processes.
++x64_client_ticks() {
++  local p stat rest total=0
++  for p in $(pgrep -f 'steamrt64/steam( |$)|/steamwebhelper( |$)' 2>/dev/null); do
++    read -r stat < "/proc/$p/stat" 2>/dev/null || continue
++    rest=${stat##*) }
++    set -- $rest
++    total=$((total + ${12:-0} + ${13:-0}))
++  done
++  echo "$total"
++}
++
++# The bootstrapper writes this log while it downloads, unpacks or verifies the client.
++x64_bootstrap_active() {
++  local f=$STEAM_X64/logs/bootstrap_log.txt
++  [ -f "$f" ] && [ $(( $(date +%s) - $(stat -c %Y "$f" 2>/dev/null || echo 0) )) -lt 30 ]
++}
++
++x64_stop_client() {
++  kill -TERM "$1" 2>/dev/null
++  for _ in $(seq 1 20); do kill -0 "$1" 2>/dev/null || break; sleep 1; done
++  kill -KILL "$1" 2>/dev/null
++  pkill -KILL -f '/steamwebhelper( |$)' 2>/dev/null
++  return 0
++}
++
++# Until the app reports the first frame on screen ($REAL_HOME/.bl-first-frame), say what the client is doing and
++# recover from what can be recognised. The menu renderer (an x86 Chromium under FEX, drawing through FEX's GL
++# thunks) giving up on the GPU leaves the screen empty for good: the client is restarted once with software
++# rendering, remembered for this client build. A client that has stopped doing anything is restarted once the same
++# way when it was on the GPU renderer, and only reported otherwise. The software choice persists, so nothing here
++# can restart the client more than once per session.
++x64_first_frame_watch() {
++  local client=$1 mode=$2 frame=$REAL_HOME/.bl-first-frame soft_file=$X64_HOME/.droiddeck-cef-software
++  local log=$STEAM_X64/logs/console-linux.txt from t0=$SECONDS last=-1 idle=0 pct=0 ticks elapsed exits hz said=0 avail lib busy
++  local tick=${BL_X64_WATCH_TICK:-5} stall=${BL_X64_WATCH_STALL:-180} least=${BL_X64_WATCH_MIN:-300} every=${BL_X64_WATCH_SAY:-30}
++  hz=$(getconf CLK_TCK 2>/dev/null || echo 100)
++  from=$(( $(wc -l 2>/dev/null < "$log" || echo 0) + 1 ))
++  while kill -0 "$client" 2>/dev/null; do
++    sleep "$tick"
++    [ -e "$frame" ] && return 0
++    elapsed=$((SECONDS - t0))
++    exits=$(tail -n +"$from" "$log" 2>/dev/null | grep -c "GPU process exited unexpectedly")
++    if [ "$mode" = gpu ] && { tail -n +"$from" "$log" 2>/dev/null | grep -q "GPU process isn't usable" || [ "${exits:-0}" -ge 3 ]; }; then
++      printf '%s\n%s\n' "$(x64_client_build)" "the GPU renderer failed ($exits GPU process exits) on $(date -u +%F)" > "$soft_file"
++      : > "$REAL_HOME/.bl-restart-software"
++      step "steam's menus failed on the GPU ($exits GPU process exits): restarting Steam with software rendering"
++      x64_stop_client "$client"
++      return 0
++    fi
++    lib=$(tail -n +"$from" "$log" 2>/dev/null | grep -o -m1 "error while loading shared libraries: [^:]*" | sed 's/.*: //')
++    ticks=$(x64_client_ticks)
++    busy=
++    x64_bootstrap_active && busy=1
++    if [ "$last" -ge 0 ]; then
++      pct=$(( (ticks - last) * 100 / (tick * hz) ))
++      if [ "$pct" -lt 3 ] && [ -z "$busy" ]; then idle=$((idle + tick)); else idle=0; fi
++    fi
++    last=$ticks
++    avail=$(awk '/^MemAvailable:/ { print int($2 / 1024) }' /proc/meminfo 2>/dev/null)
++    if [ "$idle" -ge "$stall" ] && [ "$elapsed" -ge "$least" ]; then
++      if [ "$mode" = gpu ]; then
++        printf '%s\n%s\n' "$(x64_client_build)" "the client stopped doing anything on the GPU renderer on $(date -u +%F)" > "$soft_file"
++        : > "$REAL_HOME/.bl-restart-software"
++        step "steam has done nothing for $idle s and shows no image: restarting Steam with software rendering"
++        x64_stop_client "$client"
++        return 0
++      fi
++      step "steam has done nothing for $idle s and shows no image${lib:+ (missing library $lib)}: share the logs from the menu"
++      idle=0
++      said=$elapsed
++    elif [ $((elapsed - said)) -ge "$every" ]; then
++      said=$elapsed
++      step "steam is still starting: $elapsed s, client cpu $pct%${avail:+, $avail MB free}${busy:+, updating or verifying}${lib:+, missing library $lib}"
++    fi
++  done
++}
++
+ x64_exec() {
++  local soft_file=$X64_HOME/.droiddeck-cef-software build watch=report
++  build=$(x64_client_build)
++  if [ -f "$soft_file" ]; then
++    if [ -n "$build" ] && [ "$(head -n1 "$soft_file")" = "$build" ]; then
++      export BL_X64_CEF_GPU=0
++      step "steam's menus use software rendering on this device: $(sed -n 2p "$soft_file") (client $build)"
++    else
++      rm -f "$soft_file"
++      step "the Steam client is now build ${build:-?}: trying the GPU renderer for its menus again"
++    fi
++  fi
+   x64_env
+   cd "$STEAM_X64"
+   if [ "${BL_X64_X86_WEBHELPER:-0}" != 1 ] && [ -x /usr/local/bin/droiddeck-x64-arm-webhelper ] &&
+@@ -917,6 +1012,12 @@ x64_exec() {
+       grep --line-buffered -oE 'Downloading update \([0-9,]+ of [0-9,]+ KB\)|^[[:space:]]*(\[[^]]+\][[:space:]]*)*(Extracting package|Installing update)\.\.\.[[:space:]]*$' | sed -u 's/,//g' >&2 ) &
+   echo "== x86-64 client: steamrt64 $(x64_manifest_version steamrt64) (the client may update itself)" >&2
+   x64_webhelper_gpu && { x64_gpu_watch >&2 & }
++  if [ "${BL_WEBHELPER_ARGS:-}" = stock ]; then watch=software
++  elif [ "${BL_X64_ARM_WEBHELPER:-}" = /usr/local/bin/droiddeck-x64-webhelper ]; then watch=gpu
++  fi
++  if [ ! -e "$REAL_HOME/.bl-first-frame" ] && [ "${BL_X64_FIRST_FRAME_WATCH:-1}" != 0 ]; then
++    x64_first_frame_watch "$$" "$watch" >&2 &
++  fi
+   exec "${BL_FEX:-/usr/local/bin/FEX}" "$STEAM_X64/steamrt64/steam" "$@"
+ }
+ 
+diff --git a/tools/tests/test_steam_first_frame_watch.py b/tools/tests/test_steam_first_frame_watch.py
+new file mode 100644
+index 0000000..1016214
+--- /dev/null
++++ b/tools/tests/test_steam_first_frame_watch.py
+@@ -0,0 +1,112 @@
++"""droiddeck-steam-x64's first-frame watch: while the x86-64 client starts and nothing is on screen it explains
++what the client is doing, restarts it once with software rendering when its menu renderer gives up on the GPU or
++stops doing anything, remembers that per client build, and never restarts more than once per session."""
++import os
++from pathlib import Path
++import subprocess
++import tempfile
++import time
++import unittest
++
++BIN = Path(__file__).resolve().parents[1] / 'linuxfs/overlay/usr/local/bin'
++X64 = (BIN / 'droiddeck-steam-x64').read_text()
++SESSION = (BIN / 'droiddeck-session').read_text()
++
++
++def between(text, start, end):
++    begin = text.index(start)
++    return text[begin:text.index(end, begin)]
++
++
++HELPERS = between(X64, 'x64_client_build() {', 'x64_exec() {')
++
++
++class FirstFrameWatchTest(unittest.TestCase):
++    def setUp(self):
++        self.tmp = tempfile.TemporaryDirectory()
++        self.root = Path(self.tmp.name)
++        self.home = self.root / 'home'
++        self.x64 = self.home / '.droiddeck-x64'
++        self.steam = self.x64 / 'Steam'
++        (self.steam / 'logs').mkdir(parents=True)
++        (self.steam / 'package').mkdir()
++        (self.steam / 'package/beta').write_text('publicbeta\n')
++        (self.steam / 'package/steam_client_publicbeta_steamrt64.manifest').write_text('"ubuntu12"\n{\n\t"version"\t\t"1763000000"\n}\n')
++        self.console = self.steam / 'logs/console-linux.txt'
++        self.console.write_text('old line\n')
++
++    def tearDown(self):
++        self.tmp.cleanup()
++
++    def run_watch(self, mode, during='', seconds=20, env=None):
++        script = ('step() { echo "== STEP $*"; }\n' + HELPERS +
++                  'REAL_HOME=%s X64_HOME=%s STEAM_X64=%s X64_CHANNEL=publicbeta\n'
++                  'sleep 300 & client=$!\n'
++                  'x64_first_frame_watch "$client" %s &\nwatch=$!\n%s\n'
++                  'wait "$watch"; if kill -0 "$client" 2>/dev/null; then echo CLIENT-ALIVE; kill "$client"; else echo CLIENT-STOPPED; fi\n'
++                  % (self.home, self.x64, self.steam, mode, during))
++        environment = dict(os.environ, BL_X64_WATCH_TICK='1', BL_X64_WATCH_SAY='2', BL_X64_WATCH_STALL='3',
++                           BL_X64_WATCH_MIN='4', **(env or {}))
++        return subprocess.run(['bash', '-u', '-c', script], env=environment, capture_output=True, text=True,
++                              timeout=seconds + 40)
++
++    def test_gpu_renderer_giving_up_restarts_once_with_software_rendering(self):
++        result = self.run_watch('gpu', 'sleep 1; for i in 1 2; do echo "GPU process exited unexpectedly: exit_code=139" >> %s; done; '
++                                       'echo "GPU process isn\'t usable. Goodbye." >> %s' % (self.console, self.console))
++        self.assertIn('CLIENT-STOPPED', result.stdout)
++        self.assertIn("steam's menus failed on the GPU (2 GPU process exits): restarting Steam with software rendering", result.stdout)
++        soft = (self.x64 / '.droiddeck-cef-software').read_text().splitlines()
++        self.assertEqual(soft[0], '1763000000')
++        self.assertTrue((self.home / '.bl-restart-software').exists())
++
++    def test_gpu_errors_from_an_earlier_run_are_not_counted(self):
++        self.console.write_text("GPU process isn't usable. Goodbye.\n" * 3)
++        result = self.run_watch('gpu', 'sleep 3; : > %s/.bl-first-frame' % self.home)
++        self.assertIn('CLIENT-ALIVE', result.stdout)
++        self.assertFalse((self.x64 / '.droiddeck-cef-software').exists())
++
++    def test_the_first_frame_ends_the_watch_without_touching_the_client(self):
++        result = self.run_watch('gpu', 'sleep 2; : > %s/.bl-first-frame' % self.home)
++        self.assertIn('CLIENT-ALIVE', result.stdout)
++        self.assertNotIn('restarting', result.stdout)
++
++    def test_a_stalled_client_on_the_gpu_renderer_is_restarted_with_software_rendering(self):
++        result = self.run_watch('gpu')
++        self.assertIn('CLIENT-STOPPED', result.stdout)
++        self.assertIn('shows no image: restarting Steam with software rendering', result.stdout)
++        self.assertIn('stopped doing anything', (self.x64 / '.droiddeck-cef-software').read_text())
++
++    def test_a_stalled_client_in_software_mode_is_only_reported(self):
++        result = self.run_watch('software', 'sleep 7; : > %s/.bl-first-frame' % self.home)
++        self.assertIn('CLIENT-ALIVE', result.stdout)
++        self.assertIn('shows no image: share the logs from the menu', result.stdout)
++        self.assertFalse((self.home / '.bl-restart-software').exists())
++
++    def test_progress_is_reported_while_it_starts(self):
++        result = self.run_watch('software', 'sleep 3; : > %s/.bl-first-frame' % self.home)
++        self.assertRegex(result.stdout, r'steam is still starting: \d+ s, client cpu \d+%')
++
++    def test_a_missing_library_is_named(self):
++        result = self.run_watch('software', 'sleep 1; echo "steamwebhelper: error while loading shared libraries: libnss3.so: cannot open" >> %s; '
++                                            'sleep 3; : > %s/.bl-first-frame' % (self.console, self.home))
++        self.assertIn('missing library libnss3.so', result.stdout)
++
++
++class SessionLoopTest(unittest.TestCase):
++    def test_the_session_restarts_the_client_once_for_software_rendering(self):
++        block = between(SESSION, 'if [ -f "$HOME/.bl-restart-software" ]; then', 'if [ "$steam_x64" = 1 ] && [ "$rc" -eq 132 ]')
++        self.assertIn('_bl_x64_software=1', block)
++        self.assertIn('continue', block)
++        self.assertIn('if [ -z "${_bl_x64_software:-}" ]', block)
++
++    def test_markers_are_cleared_when_a_session_starts(self):
++        self.assertIn('rm -f "$HOME/.bl-first-frame" "$HOME/.bl-restart-software"', SESSION)
++
++    def test_a_new_client_build_tries_the_gpu_again(self):
++        block = between(X64, 'x64_exec() {', 'x64_env\n  cd "$STEAM_X64"')
++        self.assertIn('export BL_X64_CEF_GPU=0', block)
++        self.assertIn('rm -f "$soft_file"', block)
++
++
++if __name__ == '__main__':
++    unittest.main()
+-- 
+2.43.0
+

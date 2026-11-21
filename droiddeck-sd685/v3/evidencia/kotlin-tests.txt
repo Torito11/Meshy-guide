@@ -1,0 +1,1 @@
+Kotlin testDebugUnitTest: 519 clases, 3886 tests, 0 fallos, 0 errores, 10 omitidos (BUILD SUCCESSFUL in 7m 48s)

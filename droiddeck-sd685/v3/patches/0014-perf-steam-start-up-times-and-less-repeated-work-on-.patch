@@ -1,0 +1,631 @@
+From 475d167068931bbe88da5398e347aef1b3d5903e Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 21 Nov 2026 15:04:41 +0000
+Subject: [PATCH 14/16] perf(steam): start-up times, and less repeated work on
+ every Steam start
+
+Times: from events.jsonl and the session script's steps the app now
+records, per start, Linux (Play -> the session script running), FEX and
+x86-64 client checks, Steam (client start -> first frame) and the total,
+first starts (downloads, installs) apart; the launcher's cold start; and
+per game launch -> first image (gamescope focuses the game window) ->
+smooth (3 s at 20+ fps). Kept in files/startup-times.jsonl and written
+to timings.txt in each session's log folder. droiddeck-game-env marks
+each launch in the session's launch folder.
+
+Less work per start on an ARMv8.0 CPU:
+- x64_prepare rebuilt Valve's runtime library links, an x86 ldconfig
+  under FEX and the pruning against the rootfs on every start, one
+  basename process per file. They are now rebuilt only when the runtime
+  or the rootfs changes (a stamp), with one ln and one rm per directory:
+  in a container, 800 links took 5.9 s, now 143 ms, and 9 ms when
+  nothing changed.
+- droiddeck-steamrt-shim uses ${e##*/} instead of a basename per entry.
+- An installed, current ARMv8.0 Proton is checked in the shell, without
+  starting Python.
+- A client build that reached the screen before starts with
+  -noverifyfiles; after an update, a repair or a start that showed
+  nothing it verifies as usual (BL_X64_VERIFY_FILES=1 forces it).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../droiddeck/launcher/FrontEndActivity.kt    |  14 ++
+ .../com/droiddeck/launcher/SessionActivity.kt |   1 +
+ .../droiddeck/launcher/agent/AgentGuest.kt    |   2 +
+ .../launcher/session/StartupTimes.kt          | 201 ++++++++++++++++++
+ .../launcher/session/StartupTimesTest.kt      |  66 ++++++
+ .../overlay/usr/local/bin/droiddeck-game-env  |  17 ++
+ .../overlay/usr/local/bin/droiddeck-session   |  14 +-
+ .../overlay/usr/local/bin/droiddeck-steam-x64 |  57 +++--
+ .../usr/local/bin/droiddeck-steamrt-shim      |   4 +-
+ tools/tests/test_game_launch_mark.py          |  32 +++
+ tools/tests/test_steam_first_frame_watch.py   |  21 ++
+ 11 files changed, 409 insertions(+), 20 deletions(-)
+ create mode 100644 app/src/main/java/com/droiddeck/launcher/session/StartupTimes.kt
+ create mode 100644 app/src/test/java/com/droiddeck/launcher/session/StartupTimesTest.kt
+ create mode 100644 tools/tests/test_game_launch_mark.py
+
+diff --git a/app/src/main/java/com/droiddeck/launcher/FrontEndActivity.kt b/app/src/main/java/com/droiddeck/launcher/FrontEndActivity.kt
+index 8b1b620..d8483dc 100644
+--- a/app/src/main/java/com/droiddeck/launcher/FrontEndActivity.kt
++++ b/app/src/main/java/com/droiddeck/launcher/FrontEndActivity.kt
+@@ -1099,6 +1099,20 @@ class FrontEndActivity : ComponentActivity() {
+ 
+     override fun onCreate(savedInstanceState: Bundle?) {
+         super.onCreate(savedInstanceState)
++        if (com.droiddeck.launcher.session.StartupTimes.coldStartPending && savedInstanceState == null) {
++            com.droiddeck.launcher.session.StartupTimes.coldStartPending = false
++            // Process start → the launcher's first frame; only a cold start says how long opening DroidDeck takes.
++            val decor = window.decorView
++            decor.viewTreeObserver.addOnPreDrawListener(object : android.view.ViewTreeObserver.OnPreDrawListener {
++                override fun onPreDraw(): Boolean {
++                    decor.viewTreeObserver.removeOnPreDrawListener(this)
++                    val ms = android.os.SystemClock.uptimeMillis() - android.os.Process.getStartUptimeMillis()
++                    if (ms in 0..60_000) Thread({ com.droiddeck.launcher.session.StartupTimes.record(applicationContext, "app", mapOf("app_open_ms" to ms)) }, "startup-times").start()
++                    return true
++                }
++            })
++        }
++        com.droiddeck.launcher.session.StartupTimes.coldStartPending = false
+         drivers.restartBlocked = ::runtimeChangesBlocked
+         drivers.loadTpUbwcMode()
+         pendingSessionLogExport = savedInstanceState?.getString(KEY_PENDING_SESSION_LOG_EXPORT)?.let(::File)
+diff --git a/app/src/main/java/com/droiddeck/launcher/SessionActivity.kt b/app/src/main/java/com/droiddeck/launcher/SessionActivity.kt
+index fd7f78d..c98c616 100644
+--- a/app/src/main/java/com/droiddeck/launcher/SessionActivity.kt
++++ b/app/src/main/java/com/droiddeck/launcher/SessionActivity.kt
+@@ -5364,6 +5364,7 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
+         SessionEvents.firstFrame()
+         // droiddeck-steam-x64 watches for this while the client starts (see x64_first_frame_watch).
+         runCatching { File(LinuxRuntime.rootDir(this), "root/.bl-first-frame").writeText("${System.currentTimeMillis()}\n") }
++        com.droiddeck.launcher.session.StartupTimes.sessionShown(SessionState.logDirectory)
+         if (SessionState.mode == SessionService.MODE_STEAM) SteamRepair.clientShown(this)
+         runOnUiThread {
+             if (isFinishing || isDestroyed) return@runOnUiThread
+diff --git a/app/src/main/java/com/droiddeck/launcher/agent/AgentGuest.kt b/app/src/main/java/com/droiddeck/launcher/agent/AgentGuest.kt
+index e04dda2..635a317 100644
+--- a/app/src/main/java/com/droiddeck/launcher/agent/AgentGuest.kt
++++ b/app/src/main/java/com/droiddeck/launcher/agent/AgentGuest.kt
+@@ -44,6 +44,7 @@ object AgentGuest {
+     fun dir(context: Context) = File(LinuxRuntime.sessionRoot(context), "agent")
+ 
+     fun reset(context: Context) {
++        com.droiddeck.launcher.session.StartupTimes.attach(context, LinuxRuntime.sessionRoot(context))
+         synchronized(lock) {
+             observer?.stopWatching()
+             observer = null
+@@ -159,6 +160,7 @@ object AgentGuest {
+         }
+         main.post { focusRevision++ }
+         SessionEvents.record("focus.changed", fields + ("seq" to snapshot.optInt("seq")))
++        com.droiddeck.launcher.session.StartupTimes.focusChanged(snapshot.opt("focusedApp")?.toString())
+     }
+ 
+     fun hello(context: Context): JSONObject? {
+diff --git a/app/src/main/java/com/droiddeck/launcher/session/StartupTimes.kt b/app/src/main/java/com/droiddeck/launcher/session/StartupTimes.kt
+new file mode 100644
+index 0000000..0ece102
+--- /dev/null
++++ b/app/src/main/java/com/droiddeck/launcher/session/StartupTimes.kt
+@@ -0,0 +1,201 @@
++package com.droiddeck.launcher.session
++
++import android.content.Context
++import android.util.Log
++import com.droiddeck.launcher.wayland.WaylandCompositor
++import org.json.JSONObject
++import java.io.File
++import java.util.Calendar
++import java.util.TimeZone
++
++/**
++ * Start-up times, measured from what a session already records: events.jsonl (the app's own events, wall-clock
++ * milliseconds) and the session script's "== STEP hh:mm:ss[.mmm]" lines (UTC). Records go to
++ * files/startup-times.jsonl (the last [KEEP]) so a start can be compared with earlier ones, and each session's
++ * phases to timings.txt in its log folder, so the diagnostics ZIP carries them.
++ *
++ * Phases of a Steam session: linux (Play pressed → the Linux session script running), fex (FEX, the x86 rootfs
++ * and the x86-64 client checked, on a CPU that needs them), steam (the client started → its first frame on
++ * screen), total. Games: launch (Proton starts the game, droiddeck-game-env) → its window focused by gamescope
++ * (first image) → 3 s in a row at 20 fps or more ("smooth"; a loading screen can count, so this is not "playable").
++ * App: process start → first frame of the launcher (cold starts only).
++ */
++object StartupTimes {
++    const val FILE = "startup-times.jsonl"
++    const val GAME_LAUNCH = "game-launch"
++    private const val TAG = "StartupTimes"
++    private const val KEEP = 80
++    private val lock = Any()
++    @Volatile private var app: Context? = null
++    @Volatile private var sessionRoot: File? = null
++    @Volatile private var focused: String? = null
++    @Volatile private var sampler: Thread? = null
++    @Volatile var coldStartPending = true
++
++    data class Step(val atMs: Long, val text: String)
++
++    fun attach(context: Context, root: File) {
++        app = context.applicationContext
++        sessionRoot = root
++        focused = null
++    }
++
++    fun record(context: Context, kind: String, values: Map<String, Any?>) {
++        val line = JSONObject().put("t", System.currentTimeMillis()).put("kind", kind)
++            .put("version", com.droiddeck.launcher.BuildConfig.VERSION_NAME)
++        values.forEach { (k, v) -> line.put(k, v ?: JSONObject.NULL) }
++        synchronized(lock) {
++            runCatching {
++                val file = File(context.filesDir, FILE)
++                val kept = (if (file.isFile) file.readLines() else emptyList()).takeLast(KEEP - 1)
++                file.writeText((kept + line.toString()).joinToString("\n") + "\n")
++            }.onFailure { Log.w(TAG, "could not save $kind times", it) }
++        }
++        Log.i(TAG, "$kind: $values")
++    }
++
++    fun recent(context: Context): List<JSONObject> = synchronized(lock) {
++        runCatching { File(context.filesDir, FILE).readLines().mapNotNull { runCatching { JSONObject(it) }.getOrNull() } }
++            .getOrDefault(emptyList())
++    }
++
++    /** UTC times of day in a session log, placed on the day the session started; rolls over midnight. */
++    internal fun steps(log: String, sessionStartMs: Long): List<Step> {
++        val day = Calendar.getInstance(TimeZone.getTimeZone("UTC")).apply {
++            timeInMillis = sessionStartMs
++            set(Calendar.HOUR_OF_DAY, 0); set(Calendar.MINUTE, 0); set(Calendar.SECOND, 0); set(Calendar.MILLISECOND, 0)
++        }.timeInMillis
++        var offset = 0L
++        var last = -1L
++        return log.lineSequence().mapNotNull { line ->
++            val m = STEP.find(line) ?: return@mapNotNull null
++            var at = day + offset + m.groupValues[1].toLong() * 3_600_000 + m.groupValues[2].toLong() * 60_000 +
++                m.groupValues[3].toLong() * 1000 + (m.groupValues[4].takeIf { it.isNotEmpty() }?.padEnd(3, '0')?.take(3)?.toLong() ?: 0)
++            if (last >= 0 && at < last - 12 * 3_600_000L) { offset += 86_400_000L; at += 86_400_000L }
++            last = at
++            Step(at, m.groupValues[5])
++        }.toList()
++    }
++
++    internal fun sessionPhases(events: List<JSONObject>, steps: List<Step>): Map<String, Long> {
++        fun event(name: String) = events.firstOrNull { it.optString("event") == name }?.optLong("t")?.takeIf { it > 0 }
++        val created = event("session.created") ?: return emptyMap()
++        val frame = event("frame.first")
++        val linux = steps.firstOrNull()?.atMs ?: event("guest.started")
++        val x64Start = steps.firstOrNull { it.text.startsWith("checking the x86-64 Steam client") }?.atMs
++        val x64Ready = steps.firstOrNull { it.text.startsWith("x86-64 Steam client ready") }?.atMs
++        val steam = steps.lastOrNull { it.text.startsWith("starting the Steam client") && (frame == null || it.atMs <= frame) }?.atMs
++        val out = linkedMapOf<String, Long>()
++        linux?.let { out["linux_ms"] = (it - created).coerceAtLeast(0) }
++        if (x64Start != null && x64Ready != null && x64Ready >= x64Start) out["fex_ms"] = x64Ready - x64Start
++        if (steam != null && frame != null) out["steam_ms"] = (frame - steam).coerceAtLeast(0)
++        if (frame != null) out["total_ms"] = (frame - created).coerceAtLeast(0)
++        return out
++    }
++
++    /** A start that downloaded, unpacked or installed something: compared apart from the ordinary ones. */
++    internal fun firstStart(steps: List<Step>): Boolean = steps.any { s ->
++        val t = s.text.lowercase()
++        t.startsWith("download") || t.startsWith("unpacking") || t.startsWith("installing") || t.startsWith("repairing")
++    }
++
++    /** Called when the session's first frame is on screen. */
++    fun sessionShown(dir: File?) {
++        val context = app ?: return
++        dir ?: return
++        Thread({
++            runCatching {
++                val events = File(dir, "events.jsonl").takeIf { it.isFile }?.readLines()
++                    ?.mapNotNull { runCatching { JSONObject(it) }.getOrNull() }.orEmpty()
++                val created = events.firstOrNull { it.optString("event") == "session.created" }?.optLong("t") ?: return@runCatching
++                val log = File(dir, "session.log").takeIf { it.isFile }?.let { tail(it, 512 * 1024) }.orEmpty()
++                val steps = steps(log, created)
++                val phases = sessionPhases(events, steps)
++                if (phases.isEmpty()) return@runCatching
++                val first = firstStart(steps)
++                record(context, "session", phases + mapOf("mode" to SessionState.mode, "first" to first))
++                File(dir, "timings.txt").writeText(describe(context))
++            }.onFailure { Log.w(TAG, "session times", it) }
++        }, "startup-times").start()
++    }
++
++    /** gamescope's focused app changed (AgentGuest). A game coming into focus after droiddeck-game-env marked its launch
++     *  gives the launch → first image time, then the launch → smooth time. */
++    fun focusChanged(focusedApp: String?) {
++        val context = app ?: return
++        val now = System.currentTimeMillis()
++        val game = focusedApp?.trim()?.takeIf { it.isNotEmpty() && it.all(Char::isDigit) && it != "0" && it != STEAM_APP }
++        val previous = focused
++        focused = focusedApp?.trim()
++        if (game == null || game == previous) return
++        val launch = readLaunch() ?: return
++        if (now - launch.first !in 0..15 * 60_000L || (launch.second != "0" && launch.second != game)) return
++        runCatching { File(sessionRoot, GAME_LAUNCH).delete() }
++        val firstImage = now - launch.first
++        sampler?.interrupt()
++        sampler = Thread({
++            var smoothAt: Long? = null
++            try {
++                var last = WaylandCompositor.gameFrameCount()
++                var run = 0
++                val end = System.currentTimeMillis() + 10 * 60_000L
++                while (System.currentTimeMillis() < end && focused == game) {
++                    Thread.sleep(1000)
++                    val count = WaylandCompositor.gameFrameCount()
++                    run = if (count - last >= 20) run + 1 else 0
++                    last = count
++                    if (run >= 3) { smoothAt = System.currentTimeMillis() - 3000; break }
++                }
++            } catch (_: InterruptedException) {
++            }
++            record(context, "game", mapOf("app" to game, "first_image_ms" to firstImage,
++                "smooth_ms" to smoothAt?.let { it - launch.first }))
++        }, "game-start-times").apply { isDaemon = true; start() }
++    }
++
++    private fun readLaunch(): Pair<Long, String>? {
++        val file = File(sessionRoot ?: return null, GAME_LAUNCH)
++        val parts = runCatching { file.readText().trim().split(Regex("\\s+")) }.getOrNull() ?: return null
++        val at = parts.getOrNull(0)?.toLongOrNull() ?: return null
++        return at to (parts.getOrNull(1) ?: "0")
++    }
++
++    private fun tail(file: File, bytes: Int): String = java.io.RandomAccessFile(file, "r").use { f ->
++        val start = (f.length() - bytes).coerceAtLeast(0)
++        f.seek(start)
++        val buf = ByteArray((f.length() - start).toInt())
++        f.readFully(buf)
++        String(buf, Charsets.UTF_8)
++    }
++
++    /** A plain-text table of the recorded times: last value, and median of the last five, per kind and phase;
++     *  first starts (downloads, installs) apart. */
++    fun describe(context: Context): String {
++        val records = recent(context)
++        val sb = StringBuilder("DroidDeck start-up times (ms). Median of the last 5, then the last value.\n")
++        fun line(title: String, rows: List<JSONObject>, key: String) {
++            val values = rows.mapNotNull { r -> r.optLong(key, -1).takeIf { it >= 0 } }
++            if (values.isEmpty()) return
++            val last5 = values.takeLast(5).sorted()
++            sb.append(String.format(java.util.Locale.ROOT, "%-42s median %7d  last %7d  (%d)\n", title, last5[last5.size / 2], values.last(), values.size))
++        }
++        val app = records.filter { it.optString("kind") == "app" }
++        line("App opening (cold start)", app, "app_open_ms")
++        for ((label, first) in listOf("Later starts" to false, "First starts (downloads/installs)" to true)) {
++            val rows = records.filter { it.optString("kind") == "session" && it.optBoolean("first") == first }
++            if (rows.isEmpty()) continue
++            sb.append(label).append(":\n")
++            line("  Linux (Play → session script)", rows, "linux_ms")
++            line("  FEX + x86-64 client checks", rows, "fex_ms")
++            line("  Steam (client start → first frame)", rows, "steam_ms")
++            line("  Total (Play → Steam on screen)", rows, "total_ms")
++        }
++        val games = records.filter { it.optString("kind") == "game" }
++        line("Game: launch → first image", games, "first_image_ms")
++        line("Game: launch → smooth (20+ fps for 3 s)", games, "smooth_ms")
++        return sb.toString()
++    }
++
++    private const val STEAM_APP = "769"
++    private val STEP = Regex("""^== STEP (\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,3}))? (.*)$""")
++}
+diff --git a/app/src/test/java/com/droiddeck/launcher/session/StartupTimesTest.kt b/app/src/test/java/com/droiddeck/launcher/session/StartupTimesTest.kt
+new file mode 100644
+index 0000000..b00e8c3
+--- /dev/null
++++ b/app/src/test/java/com/droiddeck/launcher/session/StartupTimesTest.kt
+@@ -0,0 +1,66 @@
++package com.droiddeck.launcher.session
++
++import android.app.Application
++import org.json.JSONObject
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertFalse
++import org.junit.Assert.assertTrue
++import org.junit.Test
++import org.robolectric.RuntimeEnvironment
++import java.util.Calendar
++import java.util.TimeZone
++
++@org.junit.runner.RunWith(org.robolectric.RobolectricTestRunner::class)
++@org.robolectric.annotation.Config(sdk = [33], application = Application::class)
++class StartupTimesTest {
++    private fun utc(h: Int, m: Int, s: Int, ms: Int = 0) = Calendar.getInstance(TimeZone.getTimeZone("UTC")).apply {
++        set(2026, Calendar.NOVEMBER, 21, h, m, s); set(Calendar.MILLISECOND, ms)
++    }.timeInMillis
++
++    private val log = """
++        == STEP 14:00:03.250 starting the session
++        some output
++        == STEP 14:00:10.000 checking the x86-64 Steam client (FEX, experimental; the first run downloads ~2 GB)
++        == STEP 14:00:41 FEX, rootfs and client ready
++        == STEP 14:00:42.500 x86-64 Steam client ready
++        == STEP 14:00:43.000 starting the Steam client
++        == STEP 14:01:13 steam is still starting: 30 s, client cpu 140%
++    """.trimIndent()
++
++    @Test fun phasesComeFromTheEventsAndTheScriptSteps() {
++        val created = utc(14, 0, 0)
++        val events = listOf(
++            JSONObject().put("event", "session.created").put("t", created),
++            JSONObject().put("event", "guest.started").put("t", utc(14, 0, 2)),
++            JSONObject().put("event", "frame.first").put("t", utc(14, 2, 13)),
++        )
++        val phases = StartupTimes.sessionPhases(events, StartupTimes.steps(log, created))
++        assertEquals(3_250L, phases["linux_ms"])
++        assertEquals(32_500L, phases["fex_ms"])
++        assertEquals(90_000L, phases["steam_ms"])
++        assertEquals(133_000L, phases["total_ms"])
++    }
++
++    @Test fun stepsAfterMidnightStayInOrder() {
++        val steps = StartupTimes.steps("== STEP 23:59:59.900 a\n== STEP 00:00:00.100 b", utc(23, 59, 50))
++        assertEquals(200L, steps[1].atMs - steps[0].atMs)
++    }
++
++    @Test fun downloadsMakeAFirstStart() {
++        val created = utc(14, 0, 0)
++        assertFalse(StartupTimes.firstStart(StartupTimes.steps(log, created)))
++        assertTrue(StartupTimes.firstStart(StartupTimes.steps("== STEP 14:00:01 downloading the x86-64 Steam client (x)", created)))
++    }
++
++    @Test fun recordsAreKeptAndSummarised() {
++        val app = RuntimeEnvironment.getApplication()
++        StartupTimes.record(app, "app", mapOf("app_open_ms" to 900L))
++        StartupTimes.record(app, "session", mapOf("linux_ms" to 3000L, "steam_ms" to 60000L, "total_ms" to 70000L, "first" to false))
++        StartupTimes.record(app, "game", mapOf("first_image_ms" to 25000L, "smooth_ms" to 41000L))
++        val text = StartupTimes.describe(app)
++        assertTrue(text, "App opening (cold start)" in text && "900" in text)
++        assertTrue(text, "Steam (client start → first frame)" in text && "60000" in text)
++        assertTrue(text, "Game: launch → first image" in text && "25000" in text)
++        assertEquals(3, StartupTimes.recent(app).size)
++    }
++}
+diff --git a/tools/linuxfs/overlay/usr/local/bin/droiddeck-game-env b/tools/linuxfs/overlay/usr/local/bin/droiddeck-game-env
+index 5ed1f7f..b0bb411 100755
+--- a/tools/linuxfs/overlay/usr/local/bin/droiddeck-game-env
++++ b/tools/linuxfs/overlay/usr/local/bin/droiddeck-game-env
+@@ -1203,11 +1203,28 @@ def exec_proton(command, env):
+     os.execvpe(command[0], command, env)
+ 
+ 
++def mark_launch(env, app_id):
++    """The app times launch -> first image -> smooth from this (session/StartupTimes.kt)."""
++    folder = env.get("BL_LAUNCH_DIR", "")
++    if not folder or not os.path.isdir(folder):
++        return
++    try:
++        import time
++        tmp = os.path.join(folder, ".game-launch.tmp")
++        with open(tmp, "w", encoding="utf-8") as out:
++            out.write("%d %s\n" % (int(time.time() * 1000), app_id or "0"))
++        os.replace(tmp, os.path.join(folder, "game-launch"))
++    except OSError:
++        pass
++
++
+ def main():
+     command = sys.argv[1:]
+     if not command:
+         return 2
+     env = game_gpu(os.environ.copy())
++    if len(command) > 1 and command[1] == "waitforexitandrun":
++        mark_launch(env, game_id(env))
+     mic_enabled = env.get("BL_MIC_ENABLED")
+     debug_dir = env.get("BL_DEBUG_DIR", "")
+     prefix_path = env.get("STEAM_COMPAT_DATA_PATH", "").rstrip("/")
+diff --git a/tools/linuxfs/overlay/usr/local/bin/droiddeck-session b/tools/linuxfs/overlay/usr/local/bin/droiddeck-session
+index aedff6a..2322e3f 100755
+--- a/tools/linuxfs/overlay/usr/local/bin/droiddeck-session
++++ b/tools/linuxfs/overlay/usr/local/bin/droiddeck-session
+@@ -701,9 +701,17 @@ case $mode in
+         droiddeck-steam-install --sync steamdeck_publicbeta || step "could not update the arm64 client's parts; the x86-64 client keeps its own web helper"
+       fi
+       if [ "$_bl_armv80" = 1 ]; then
+-        step "checking Proton for this CPU (ARMv8.0; the first time downloads 626 MB and takes a few minutes)"
+-        droiddeck-proton-armv80 "$XDG_DATA_HOME/Steam" ||
+-          step "Proton for ARMv8.0 could not be installed now; Windows games use droiddeck-proton-x64 until it is"
++        # Installed and current (its marker holds the patch's sha256): no Python start on every session.
++        _bl_v80_patch=/usr/local/share/droiddeck-armv80/DroidDeck-Proton-11-12.8.lse80
++        _bl_v80_mark=$XDG_DATA_HOME/Steam/compatibilitytools.d/ARMv8.0-DroidDeck-Proton-11-12.8/.droiddeck-armv80
++        if [ -f "$_bl_v80_mark" ] && [ -f "$_bl_v80_patch" ] &&
++           [ "$(cat "$_bl_v80_mark" 2>/dev/null)" = "$(sha256sum "$_bl_v80_patch" | cut -d' ' -f1)" ]; then
++          echo "== proton: DroidDeck-Proton 11-12.8 (ARMv8.0) is installed and current"
++        else
++          step "checking Proton for this CPU (ARMv8.0; the first time downloads 626 MB and takes a few minutes)"
++          droiddeck-proton-armv80 "$XDG_DATA_HOME/Steam" ||
++            step "Proton for ARMv8.0 could not be installed now; Windows games use droiddeck-proton-x64 until it is"
++        fi
+       fi
+       step "checking the x86-64 Steam client (FEX, experimental; the first run downloads ~2 GB)"
+       BL_X64_REPAIR=$_bl_x64_repair droiddeck-steam-x64 --prepare || steam_setup_failed $?
+diff --git a/tools/linuxfs/overlay/usr/local/bin/droiddeck-steam-x64 b/tools/linuxfs/overlay/usr/local/bin/droiddeck-steam-x64
+index 95ea556..729f8e6 100755
+--- a/tools/linuxfs/overlay/usr/local/bin/droiddeck-steam-x64
++++ b/tools/linuxfs/overlay/usr/local/bin/droiddeck-steam-x64
+@@ -464,6 +464,7 @@ elif [ -f "$unconfirmed" ] && ! grep -qx repaired "$unconfirmed" && [ "$(grep -c
+ fi
+ if [ -n "$x64_repair" ]; then
+   step "repairing the x86-64 Steam client ($x64_repair)"
++  rm -f "$X64_HOME/.droiddeck-client-ok" "$X64_HOME/.droiddeck-cef-software"
+   rm -f "$STEAM_X64/package/droiddeck-installed" "$STEAM_X64/.crash" "$STEAM_X64/steam.pid" \
+     "$STEAM_X64"/package/steam_client_*.installed
+ fi
+@@ -526,23 +527,37 @@ ln -sfn "$STEAM_X64/linux32" "$X64_HOME/.steam/sdk32"
+ ln -sfn "$STEAM_X64/linux64" "$X64_HOME/.steam/sdk64"
+ droiddeck-steamrt-shim "$STEAM_X64/steamrt64" "$X64_HOME/steamrt-shim" || rm -rf "$X64_HOME/steamrt-shim"
+ srt_libs=$X64_HOME/steamrt-libs
+-rm -rf "$srt_libs"
+-mkdir -p "$srt_libs"
++sniper_compat=$X64_HOME/sniper-compat
++srt_dirs=()
+ for d in "$STEAM_X64"/steamrt64/pv-runtime/steam-runtime-steamrt/steamrt3c_platform_*/files/lib/x86_64-linux-gnu \
+          "$STEAM_X64"/steamrt64/pv-runtime/steam-runtime-steamrt/steamrt3c_platform_*/files/usr/lib/x86_64-linux-gnu; do
+-  [ -d "$d" ] || continue
+-  for f in "$d"/*.so*; do [ -e "$srt_libs/$(basename "$f")" ] || ln -s "$f" "$srt_libs/"; done
+-done
+-FEX_ROOTFS=$ROOTFS /usr/local/bin/FEX "$ROOTFS/usr/sbin/ldconfig.real" -n "$srt_libs" >>"$LOG" 2>&1 || step "ldconfig on $srt_libs failed"
+-sniper_compat=$X64_HOME/sniper-compat
+-rm -rf "$sniper_compat"
+-mkdir -p "$sniper_compat"
+-hb=$(ls "$srt_libs"/libharfbuzz.so.0.* 2>/dev/null | head -n 1)
+-if [ -n "$hb" ]; then ln -s "$hb" "$sniper_compat/libharfbuzz.so.0"; else step "warning: no HarfBuzz in Valve's runtime for the newer-runtime titles"; fi
+-for f in "$srt_libs"/*; do
+-  n=$(basename "$f")
+-  if [ -e "$ROOTFS/usr/lib/x86_64-linux-gnu/$n" ] || [ -e "$ROOTFS/lib/x86_64-linux-gnu/$n" ]; then rm -f "$f"; fi
++  [ -d "$d" ] && srt_dirs+=("$d")
+ done
++# These links, their ld.so cache and the pruning against the rootfs only change with Valve's runtime or the rootfs.
++# Rebuilding them every start cost hundreds of links and an x86 ldconfig under FEX; now only when the stamp differs.
++srt_stamp="rootfs ${ROOTFS_SHA256:-?} $(for d in "${srt_dirs[@]}"; do printf '%s %s ' "$d" "$(stat -c %Y "$d" 2>/dev/null)"; done)"
++if [ "$(cat "$srt_libs/.droiddeck-stamp" 2>/dev/null)" != "$srt_stamp" ] || [ ! -d "$sniper_compat" ]; then
++  rm -rf "$srt_libs"
++  mkdir -p "$srt_libs"
++  for d in "${srt_dirs[@]}"; do
++    # One ln for the whole directory; a name already linked from an earlier directory keeps that link.
++    srt_files=("$d"/*.so*)
++    [ -e "${srt_files[0]}" ] && { ln -s "${srt_files[@]}" "$srt_libs/" 2>/dev/null || true; }
++  done
++  FEX_ROOTFS=$ROOTFS /usr/local/bin/FEX "$ROOTFS/usr/sbin/ldconfig.real" -n "$srt_libs" >>"$LOG" 2>&1 || step "ldconfig on $srt_libs failed"
++  rm -rf "$sniper_compat"
++  mkdir -p "$sniper_compat"
++  hb=$(ls "$srt_libs"/libharfbuzz.so.0.* 2>/dev/null | head -n 1)
++  if [ -n "$hb" ]; then ln -s "$hb" "$sniper_compat/libharfbuzz.so.0"; else step "warning: no HarfBuzz in Valve's runtime for the newer-runtime titles"; fi
++  srt_prune=()
++  for f in "$srt_libs"/*; do
++    n=${f##*/}
++    if [ -e "$ROOTFS/usr/lib/x86_64-linux-gnu/$n" ] || [ -e "$ROOTFS/lib/x86_64-linux-gnu/$n" ]; then srt_prune+=("$f"); fi
++  done
++  [ "${#srt_prune[@]}" -gt 0 ] && rm -f "${srt_prune[@]}"
++  printf '%s' "$srt_stamp" > "$srt_libs/.droiddeck-stamp"
++  echo "== x86-64: Valve runtime libraries linked for the client ($(ls "$srt_libs" | wc -l) kept)" >&2
++fi
+   tool=$STEAM_X64/compatibilitytools.d/droiddeck-direct
+   mkdir -p "$tool"
+   rm -f "$tool/droiddeck-proton-wrap" "$tool/toolmanifest.vdf.droiddeck-orig"
+@@ -928,7 +943,11 @@ x64_first_frame_watch() {
+   from=$(( $(wc -l 2>/dev/null < "$log" || echo 0) + 1 ))
+   while kill -0 "$client" 2>/dev/null; do
+     sleep "$tick"
+-    [ -e "$frame" ] && return 0
++    if [ -e "$frame" ]; then
++      # This build showed its menus: the next start may skip re-verifying its files (see x64_exec).
++      x64_client_build > "$X64_HOME/.droiddeck-client-ok.tmp" 2>/dev/null && mv -f "$X64_HOME/.droiddeck-client-ok.tmp" "$X64_HOME/.droiddeck-client-ok"
++      return 0
++    fi
+     elapsed=$((SECONDS - t0))
+     exits=$(tail -n +"$from" "$log" 2>/dev/null | grep -c "GPU process exited unexpectedly")
+     if [ "$mode" = gpu ] && { tail -n +"$from" "$log" 2>/dev/null | grep -q "GPU process isn't usable" || [ "${exits:-0}" -ge 3 ]; }; then
+@@ -978,6 +997,14 @@ x64_exec() {
+       step "the Steam client is now build ${build:-?}: trying the GPU renderer for its menus again"
+     fi
+   fi
++  # The bootstrapper re-checks every client file at each start, slowly under FEX. When this same build reached the
++  # screen before, it is not asked to; after an update, a repair or a start that showed nothing, it checks as usual.
++  if [ -n "$build" ] && [ "${BL_X64_VERIFY_FILES:-0}" != 1 ] && [ "$(cat "$X64_HOME/.droiddeck-client-ok" 2>/dev/null)" = "$build" ]; then
++    set -- "$@" -noverifyfiles
++    echo "== x86-64 client: build $build reached the screen before; starting it without re-verifying its files" >&2
++  else
++    rm -f "$X64_HOME/.droiddeck-client-ok"
++  fi
+   x64_env
+   cd "$STEAM_X64"
+   if [ "${BL_X64_X86_WEBHELPER:-0}" != 1 ] && [ -x /usr/local/bin/droiddeck-x64-arm-webhelper ] &&
+diff --git a/tools/linuxfs/overlay/usr/local/bin/droiddeck-steamrt-shim b/tools/linuxfs/overlay/usr/local/bin/droiddeck-steamrt-shim
+index 725db47..9fecf4b 100755
+--- a/tools/linuxfs/overlay/usr/local/bin/droiddeck-steamrt-shim
++++ b/tools/linuxfs/overlay/usr/local/bin/droiddeck-steamrt-shim
+@@ -16,11 +16,11 @@ trap 'rm -rf "$shim"' ERR
+ mkdir -p "$shim/bin"
+ for e in "$srt_real"/* "$srt_real"/.[!.]*; do
+   [ -e "$e" ] || continue
+-  [ "$(basename "$e")" = bin ] || ln -s "$e" "$shim/$(basename "$e")"
++  [ "${e##*/}" = bin ] || ln -s "$e" "$shim/${e##*/}"
+ done
+ for e in "$srt_real"/bin/*; do
+   [ -e "$e" ] || continue
+-  ln -s "$e" "$shim/bin/$(basename "$e")"
++  ln -s "$e" "$shim/bin/${e##*/}"
+ done
+ rm -f "$shim/bin/steam-runtime-check-requirements"
+ printf '#!/bin/sh
+diff --git a/tools/tests/test_game_launch_mark.py b/tools/tests/test_game_launch_mark.py
+new file mode 100644
+index 0000000..70da052
+--- /dev/null
++++ b/tools/tests/test_game_launch_mark.py
+@@ -0,0 +1,32 @@
++"""droiddeck-game-env marks each game launch in the session's launch folder for the app's start-up times."""
++from pathlib import Path
++import runpy
++import tempfile
++import time
++import unittest
++
++BIN = Path(__file__).resolve().parents[1] / 'linuxfs/overlay/usr/local/bin'
++GAME_ENV = runpy.run_path(str(BIN / 'droiddeck-game-env'))
++
++
++class GameLaunchMarkTest(unittest.TestCase):
++    def test_launch_time_and_game_are_written_atomically(self):
++        with tempfile.TemporaryDirectory() as folder:
++            before = int(time.time() * 1000)
++            GAME_ENV['mark_launch']({'BL_LAUNCH_DIR': folder}, '1091500')
++            at, game = (Path(folder) / 'game-launch').read_text().split()
++            self.assertEqual(game, '1091500')
++            self.assertTrue(before <= int(at) <= int(time.time() * 1000))
++            self.assertFalse((Path(folder) / '.game-launch.tmp').exists())
++
++    def test_no_launch_folder_writes_nothing(self):
++        GAME_ENV['mark_launch']({}, '10')
++        GAME_ENV['mark_launch']({'BL_LAUNCH_DIR': '/nonexistent/droiddeck'}, '10')
++
++    def test_only_the_game_itself_is_marked(self):
++        source = (BIN / 'droiddeck-game-env').read_text()
++        self.assertIn('if len(command) > 1 and command[1] == "waitforexitandrun":\n        mark_launch(env, game_id(env))', source)
++
++
++if __name__ == '__main__':
++    unittest.main()
+diff --git a/tools/tests/test_steam_first_frame_watch.py b/tools/tests/test_steam_first_frame_watch.py
+index 1016214..56bdebf 100644
+--- a/tools/tests/test_steam_first_frame_watch.py
++++ b/tools/tests/test_steam_first_frame_watch.py
+@@ -69,6 +69,8 @@ class FirstFrameWatchTest(unittest.TestCase):
+         result = self.run_watch('gpu', 'sleep 2; : > %s/.bl-first-frame' % self.home)
+         self.assertIn('CLIENT-ALIVE', result.stdout)
+         self.assertNotIn('restarting', result.stdout)
++        # the build that reached the screen is remembered, so its next start can skip re-verifying its files
++        self.assertEqual((self.x64 / '.droiddeck-client-ok').read_text().strip(), '1763000000')
+ 
+     def test_a_stalled_client_on_the_gpu_renderer_is_restarted_with_software_rendering(self):
+         result = self.run_watch('gpu')
+@@ -102,6 +104,25 @@ class SessionLoopTest(unittest.TestCase):
+     def test_markers_are_cleared_when_a_session_starts(self):
+         self.assertIn('rm -f "$HOME/.bl-first-frame" "$HOME/.bl-restart-software"', SESSION)
+ 
++    def test_only_a_build_that_reached_the_screen_skips_verification(self):
++        block = between(X64, 'x64_exec() {', 'x64_env\n  cd "$STEAM_X64"')
++        self.assertIn('[ "$(cat "$X64_HOME/.droiddeck-client-ok" 2>/dev/null)" = "$build" ]', block)
++        self.assertIn('set -- "$@" -noverifyfiles', block)
++        self.assertIn('rm -f "$X64_HOME/.droiddeck-client-ok"', block)
++        repair = between(X64, 'step "repairing the x86-64 Steam client ($x64_repair)"', 'fi\n')
++        self.assertIn('.droiddeck-client-ok', repair)
++
++    def test_runtime_links_are_rebuilt_only_when_the_runtime_changes(self):
++        block = between(X64, 'srt_libs=$X64_HOME/steamrt-libs', 'tool=$STEAM_X64/compatibilitytools.d/droiddeck-direct')
++        self.assertIn('if [ "$(cat "$srt_libs/.droiddeck-stamp" 2>/dev/null)" != "$srt_stamp" ]', block)
++        self.assertIn('ROOTFS_SHA256', block)
++        self.assertNotIn('$(basename', block)
++
++    def test_an_installed_armv80_proton_is_checked_without_python(self):
++        block = between(SESSION, '_bl_v80_patch=', 'step "checking the x86-64 Steam client')
++        self.assertIn('sha256sum "$_bl_v80_patch"', block)
++        self.assertIn('droiddeck-proton-armv80 "$XDG_DATA_HOME/Steam"', block)
++
+     def test_a_new_client_build_tries_the_gpu_again(self):
+         block = between(X64, 'x64_exec() {', 'x64_env\n  cd "$STEAM_X64"')
+         self.assertIn('export BL_X64_CEF_GPU=0', block)
+-- 
+2.43.0
+

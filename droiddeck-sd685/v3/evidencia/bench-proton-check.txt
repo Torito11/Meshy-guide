@@ -1,0 +1,1 @@
+# Comprobación del Proton ARMv8.0 instalado, media de 5: python (v2) 41 ms, shell (v3) 5 ms (contenedor)

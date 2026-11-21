@@ -1,0 +1,122 @@
+From 64621867ec25c0bdcb5f05633f9ea042a7d5e731 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 21 Nov 2026 15:23:25 +0000
+Subject: [PATCH 16/16] fix: x64_exec works without X64_HOME, and say when
+ Microsoft offers no region
+
+- x64_exec's new renderer and verification checks read X64_HOME under
+  set -u; test_steam_x64_cpu.py runs x64_exec without it and failed.
+  They now skip themselves when it is unset (the launcher always sets it).
+- An Xbox account with no Xbox Cloud Gaming region says that the service
+  may not be available in the user's country or subscription, and that
+  DroidDeck does not work around it, instead of "No Xbox Cloud Gaming
+  region".
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../launcher/stores/xbox/XboxCloudSession.kt      |  3 ++-
+ app/src/main/res/values-b+es+419/strings.xml      |  1 +
+ app/src/main/res/values-es/strings.xml            |  1 +
+ app/src/main/res/values/strings.xml               |  1 +
+ .../overlay/usr/local/bin/droiddeck-steam-x64     | 15 +++++++++------
+ tools/tests/test_steam_first_frame_watch.py       |  4 ++--
+ 6 files changed, 16 insertions(+), 9 deletions(-)
+
+diff --git a/app/src/main/java/com/droiddeck/launcher/stores/xbox/XboxCloudSession.kt b/app/src/main/java/com/droiddeck/launcher/stores/xbox/XboxCloudSession.kt
+index 835a551..0d3a5a2 100644
+--- a/app/src/main/java/com/droiddeck/launcher/stores/xbox/XboxCloudSession.kt
++++ b/app/src/main/java/com/droiddeck/launcher/stores/xbox/XboxCloudSession.kt
+@@ -29,7 +29,8 @@ internal object XboxCloudSession {
+         val array = json.getJSONArray("regions")
+         val regions = (0 until array.length()).map { array.getJSONObject(it) }
+             .map { Region(it.getString("name"), it.getString("baseUri"), it.optBoolean("isDefault")) }
+-        val default = regions.firstOrNull { it.isDefault } ?: regions.firstOrNull() ?: error("No Xbox Cloud Gaming region")
++        val default = regions.firstOrNull { it.isDefault } ?: regions.firstOrNull()
++            ?: error(app.getString(com.droiddeck.launcher.R.string.xcloud_no_region))
+         val seconds = json.optLong("durationInSeconds").coerceIn(0, 24 * 3600)
+         return Session(account, json.getString("gsToken"), json.getString("offering"), default.baseUri, regions,
+             json.optString("userToken").takeIf { !json.isNull("userToken") && it.isNotEmpty() }, System.currentTimeMillis() + seconds * 1000).also { cached = it }
+diff --git a/app/src/main/res/values-b+es+419/strings.xml b/app/src/main/res/values-b+es+419/strings.xml
+index 6de2db7..c43f8b3 100644
+--- a/app/src/main/res/values-b+es+419/strings.xml
++++ b/app/src/main/res/values-b+es+419/strings.xml
+@@ -3744,4 +3744,5 @@
+     <string name="xcloud_region_lowest">Menor latencia medida</string>
+     <string name="xcloud_auto_quality">Calidad automática</string>
+     <string name="xcloud_auto_quality_hint" formatted="false">Sin límite de bitrate fijado: tras una transmisión que perdió más del 2 % de los paquetes, la siguiente se limita al 80 % del bitrate que alcanzó; tras transmisiones limpias el límite vuelve a subir.</string>
++    <string name="xcloud_no_region">Microsoft no ofreció ninguna región de Xbox Cloud Gaming a esta cuenta. Puede que el servicio no esté disponible en tu país o con tu suscripción; DroidDeck no lo esquiva.</string>
+ </resources>
+diff --git a/app/src/main/res/values-es/strings.xml b/app/src/main/res/values-es/strings.xml
+index 736b875..3c2cb5f 100644
+--- a/app/src/main/res/values-es/strings.xml
++++ b/app/src/main/res/values-es/strings.xml
+@@ -3772,4 +3772,5 @@
+     <string name="xcloud_region_lowest">Menor latencia medida</string>
+     <string name="xcloud_auto_quality">Calidad automática</string>
+     <string name="xcloud_auto_quality_hint" formatted="false">Sin límite de bitrate fijado: tras una transmisión que perdió más del 2 % de los paquetes, la siguiente se limita al 80 % del bitrate que alcanzó; tras transmisiones limpias el límite vuelve a subir.</string>
++    <string name="xcloud_no_region">Microsoft no ofreció ninguna región de Xbox Cloud Gaming a esta cuenta. Puede que el servicio no esté disponible en tu país o con tu suscripción; DroidDeck no lo esquiva.</string>
+ </resources>
+diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
+index 1c40d20..4bb271c 100644
+--- a/app/src/main/res/values/strings.xml
++++ b/app/src/main/res/values/strings.xml
+@@ -3894,4 +3894,5 @@
+     <string name="xcloud_region_lowest">Lowest measured latency</string>
+     <string name="xcloud_auto_quality">Automatic quality</string>
+     <string name="xcloud_auto_quality_hint" formatted="false">With no bitrate limit set: after a stream that lost over 2% of its packets, the next one is limited to 80% of the rate it reached; after clean streams the limit rises again.</string>
++    <string name="xcloud_no_region">Microsoft offered no Xbox Cloud Gaming region to this account. The service may not be available in your country or with your subscription; DroidDeck does not work around that.</string>
+ </resources>
+diff --git a/tools/linuxfs/overlay/usr/local/bin/droiddeck-steam-x64 b/tools/linuxfs/overlay/usr/local/bin/droiddeck-steam-x64
+index 729f8e6..3282610 100755
+--- a/tools/linuxfs/overlay/usr/local/bin/droiddeck-steam-x64
++++ b/tools/linuxfs/overlay/usr/local/bin/droiddeck-steam-x64
+@@ -986,9 +986,12 @@ x64_first_frame_watch() {
+ }
+ 
+ x64_exec() {
+-  local soft_file=$X64_HOME/.droiddeck-cef-software build watch=report
+-  build=$(x64_client_build)
+-  if [ -f "$soft_file" ]; then
++  local x64_home=${X64_HOME:-} soft_file= build= watch=report
++  if [ -n "$x64_home" ]; then
++    soft_file=$x64_home/.droiddeck-cef-software
++    build=$(x64_client_build || true)
++  fi
++  if [ -n "$soft_file" ] && [ -f "$soft_file" ]; then
+     if [ -n "$build" ] && [ "$(head -n1 "$soft_file")" = "$build" ]; then
+       export BL_X64_CEF_GPU=0
+       step "steam's menus use software rendering on this device: $(sed -n 2p "$soft_file") (client $build)"
+@@ -999,11 +1002,11 @@ x64_exec() {
+   fi
+   # The bootstrapper re-checks every client file at each start, slowly under FEX. When this same build reached the
+   # screen before, it is not asked to; after an update, a repair or a start that showed nothing, it checks as usual.
+-  if [ -n "$build" ] && [ "${BL_X64_VERIFY_FILES:-0}" != 1 ] && [ "$(cat "$X64_HOME/.droiddeck-client-ok" 2>/dev/null)" = "$build" ]; then
++  if [ -n "$build" ] && [ "${BL_X64_VERIFY_FILES:-0}" != 1 ] && [ "$(cat "$x64_home/.droiddeck-client-ok" 2>/dev/null)" = "$build" ]; then
+     set -- "$@" -noverifyfiles
+     echo "== x86-64 client: build $build reached the screen before; starting it without re-verifying its files" >&2
+-  else
+-    rm -f "$X64_HOME/.droiddeck-client-ok"
++  elif [ -n "$x64_home" ]; then
++    rm -f "$x64_home/.droiddeck-client-ok"
+   fi
+   x64_env
+   cd "$STEAM_X64"
+diff --git a/tools/tests/test_steam_first_frame_watch.py b/tools/tests/test_steam_first_frame_watch.py
+index 56bdebf..a7a9c1f 100644
+--- a/tools/tests/test_steam_first_frame_watch.py
++++ b/tools/tests/test_steam_first_frame_watch.py
+@@ -106,9 +106,9 @@ class SessionLoopTest(unittest.TestCase):
+ 
+     def test_only_a_build_that_reached_the_screen_skips_verification(self):
+         block = between(X64, 'x64_exec() {', 'x64_env\n  cd "$STEAM_X64"')
+-        self.assertIn('[ "$(cat "$X64_HOME/.droiddeck-client-ok" 2>/dev/null)" = "$build" ]', block)
++        self.assertIn('[ "$(cat "$x64_home/.droiddeck-client-ok" 2>/dev/null)" = "$build" ]', block)
+         self.assertIn('set -- "$@" -noverifyfiles', block)
+-        self.assertIn('rm -f "$X64_HOME/.droiddeck-client-ok"', block)
++        self.assertIn('rm -f "$x64_home/.droiddeck-client-ok"', block)
+         repair = between(X64, 'step "repairing the x86-64 Steam client ($x64_repair)"', 'fi\n')
+         self.assertIn('.droiddeck-client-ok', repair)
+ 
+-- 
+2.43.0
+

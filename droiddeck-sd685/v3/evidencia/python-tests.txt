@@ -1,0 +1,199 @@
+......................................................................... [  3%]
+.................................................. [  5%]
+.................................................. [  7%]
+...................s.................................ss.. [ 10%]
+..........................................ssssss........ [ 13%]
+......................................................... [ 15%]
+...........................................s...ss...ss.... [ 18%]
+s................................................s..... [ 20%]
+.................................................... [ 23%]
+........................................................................ [ 26%]
+........................................................................ [ 29%]
+........................................................................ [ 33%]
+...............................................ssss......... [ 35%]
+...............................................................sss...................s...................................................................... [ 43%]
+..................................... [ 44%]
+..................................................................................................................................................................sssssssssssssssssssssss [ 53%]
+sssssssssss..................................................... [ 56%]
+.............s.................. [ 57%]
+..sssssssssss..........................F................................................................. [ 62%]
+.................................................................ssss.......................... [ 66%]
+............s.............................................. [ 69%]
+.................................................................. [ 72%]
+.............................................. [ 74%]
+..................................................................... [ 77%]
+................................................................... [ 80%]
+........................................................................ [ 84%]
+................................................................. [ 87%]
+.......................................................... [ 89%]
+........................................................................ [ 93%]
+...........................................F..sssssssssssss....sss...... [ 96%]
+....................................................ssss............ [ 99%]
+..sF...ss                                                                [100%]
+=================================== FAILURES ===================================
+_ PipeWireHelperTest.test_start_waits_for_the_socket_and_stop_ends_both_daemons _
+
+self = <test_pipewire_helper.PipeWireHelperTest testMethod=test_start_waits_for_the_socket_and_stop_ends_both_daemons>
+
+    def test_start_waits_for_the_socket_and_stop_ends_both_daemons(self):
+        socket = self.runtime / 'pipewire-0'
+        self.pack('python3 -c "import socket,sys; s=socket.socket(socket.AF_UNIX); s.bind(sys.argv[1]); '
+                  'import time; time.sleep(30)" "$XDG_RUNTIME_DIR/pipewire-0"')
+        result = self.run_helper('start')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(socket.is_socket())
+        pids = (self.runtime / 'droiddeck-pipewire/pids').read_text().split()
+        self.assertEqual(len(pids), 2)
+        self.run_helper('stop')
+        for pid in pids:
+>           subprocess.run(['sh', '-c', 'for i in 1 2 3 4 5 6 7 8 9 10; do kill -0 %s 2>/dev/null || exit 0; '
+                            'sleep 0.1; done; exit 1' % pid], check=True)
+
+tools/tests/test_pipewire_helper.py:67: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+input = None, capture_output = False, timeout = None, check = True
+popenargs = (['sh', '-c', 'for i in 1 2 3 4 5 6 7 8 9 10; do kill -0 17090 2>/dev/null || exit 0; sleep 0.1; done; exit 1'],)
+kwargs = {}
+
+    def run(*popenargs,
+            input=None, capture_output=False, timeout=None, check=False, **kwargs):
+        """Run command with arguments and return a CompletedProcess instance.
+    
+        The returned instance will have attributes args, returncode, stdout and
+        stderr. By default, stdout and stderr are not captured, and those attributes
+        will be None. Pass stdout=PIPE and/or stderr=PIPE in order to capture them,
+        or pass capture_output=True to capture both.
+    
+        If check is True and the exit code was non-zero, it raises a
+        CalledProcessError. The CalledProcessError object will have the return code
+        in the returncode attribute, and output & stderr attributes if those streams
+        were captured.
+    
+        If timeout (seconds) is given and the process takes too long,
+         a TimeoutExpired exception will be raised.
+    
+        There is an optional argument "input", allowing you to
+        pass bytes or a string to the subprocess's stdin.  If you use this argument
+        you may not also use the Popen constructor's "stdin" argument, as
+        it will be used internally.
+    
+        By default, all communication is in bytes, and therefore any "input" should
+        be bytes, and the stdout and stderr will be bytes. If in text mode, any
+        "input" should be a string, and stdout and stderr will be strings decoded
+        according to locale encoding, or by "encoding" if set. Text mode is
+        triggered by setting any of text, encoding, errors or universal_newlines.
+    
+        The other arguments are the same as for the Popen constructor.
+        """
+        if input is not None:
+            if kwargs.get('stdin') is not None:
+                raise ValueError('stdin and input arguments may not both be used.')
+            kwargs['stdin'] = PIPE
+    
+        if capture_output:
+            if kwargs.get('stdout') is not None or kwargs.get('stderr') is not None:
+                raise ValueError('stdout and stderr arguments may not be used '
+                                 'with capture_output.')
+            kwargs['stdout'] = PIPE
+            kwargs['stderr'] = PIPE
+    
+        with Popen(*popenargs, **kwargs) as process:
+            try:
+                stdout, stderr = process.communicate(input, timeout=timeout)
+            except TimeoutExpired as exc:
+                process.kill()
+                if _mswindows:
+                    # Windows accumulates the output in a single blocking
+                    # read() call run on child threads, with the timeout
+                    # being done in a join() on those threads.  communicate()
+                    # _after_ kill() is required to collect that and add it
+                    # to the exception.
+                    exc.stdout, exc.stderr = process.communicate()
+                else:
+                    # POSIX _communicate already populated the output so
+                    # far into the TimeoutExpired exception.
+                    process.wait()
+                raise
+            except:  # Including KeyboardInterrupt, communicate handled that.
+                process.kill()
+                # We don't call process.wait() as .__exit__ does that for us.
+                raise
+            retcode = process.poll()
+            if check and retcode:
+>               raise CalledProcessError(retcode, process.args,
+                                         output=stdout, stderr=stderr)
+E               subprocess.CalledProcessError: Command '['sh', '-c', 'for i in 1 2 3 4 5 6 7 8 9 10; do kill -0 17090 2>/dev/null || exit 0; sleep 0.1; done; exit 1']' returned non-zero exit status 1.
+
+/usr/local/lib/python3.13/subprocess.py:578: CalledProcessError
+_______________ VkExternalImageSyncTest.test_client_barrier_pair _______________
+
+self = <test_vk_external_image_sync.VkExternalImageSyncTest testMethod=test_client_barrier_pair>
+
+    def test_client_barrier_pair(self):
+        compiler = shutil.which(os.environ.get("CC", "cc"))
+        if not compiler:
+            self.fail("A C compiler is required for the Vulkan image-sync regression test")
+    
+        tests = Path(__file__).resolve().parent
+        source = tests / "vk_external_image_sync_test.c"
+        includes = tests.parents[1] / "app/src/main/cpp/waylandcomp/src"
+        with tempfile.TemporaryDirectory(prefix="droiddeck-vk-sync-") as tmp:
+            program = Path(tmp) / "vk-external-image-sync"
+            command = [
+                compiler,
+                "-std=c11",
+                "-Wall",
+                "-Wextra",
+                "-Werror",
+                "-UNDEBUG",
+                "-I",
+                str(includes),
+                *vulkan_include_args(),
+                str(source),
+                "-o",
+                str(program),
+            ]
+            built = subprocess.run(command, capture_output=True, text=True)
+>           self.assertEqual(built.returncode, 0, built.stdout + built.stderr)
+E           AssertionError: 1 != 0 : In file included from /home/user/droid-deck/droiddeck/tools/tests/vk_external_image_sync_test.c:5:
+E           /home/user/droid-deck/droiddeck/app/src/main/cpp/waylandcomp/src/vk_external_image_sync.h:4:10: fatal error: vulkan/vulkan.h: No such file or directory
+E               4 | #include <vulkan/vulkan.h>
+E                 |          ^~~~~~~~~~~~~~~~~
+E           compilation terminated.
+
+tools/tests/test_vk_external_image_sync.py:57: AssertionError
+_________ XclipseLayerTest.test_layer_against_a_mock_loader_and_driver _________
+
+self = <test_xclipse_layer.XclipseLayerTest testMethod=test_layer_against_a_mock_loader_and_driver>
+
+    def test_layer_against_a_mock_loader_and_driver(self):
+        compiler = shutil.which(os.environ.get("CC", "cc"))
+        if not compiler:
+            self.fail("A C compiler is required for the Xclipse layer regression test")
+        # The build compiles the layer against the distribution's headers (libvulkan-dev);
+        # VULKAN_INCLUDE points elsewhere, e.g. a Vulkan-Headers checkout on macOS.
+        include = Path(os.environ.get("VULKAN_INCLUDE", "/usr/include"))
+        if not (include / "vulkan/vk_layer.h").is_file():
+>           self.fail("Vulkan headers are required: install libvulkan-dev or set VULKAN_INCLUDE")
+E           AssertionError: Vulkan headers are required: install libvulkan-dev or set VULKAN_INCLUDE
+
+tools/tests/test_xclipse_layer.py:22: AssertionError
+=============================== warnings summary ===============================
+tools/tests/test_esync_packs.py::ShadowTest::test_concurrent_ensure_dist_builds_one_dist
+tools/tests/test_esync_packs.py::ShadowTest::test_concurrent_ensure_dist_builds_one_dist
+tools/tests/test_esync_packs.py::ShadowTest::test_concurrent_ensure_dist_builds_one_dist
+tools/tests/test_esync_packs.py::ShadowTest::test_concurrent_ensure_dist_builds_one_dist
+  /usr/local/lib/python3.13/multiprocessing/popen_fork.py:73: DeprecationWarning: This process (pid=3044) is multi-threaded, use of fork() may lead to deadlocks in the child.
+    self.pid = os.fork()
+
+tools/tests/test_powervr_runtime.py::PowerVRRuntimeTest::test_zip_rejects_unknown_and_duplicate_members
+  /usr/local/lib/python3.13/zipfile/__init__.py:1686: UserWarning: Duplicate name: 'allowed'
+    return self._open_to_write(zinfo, force_zip64=force_zip64)
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+FAILED tools/tests/test_pipewire_helper.py::PipeWireHelperTest::test_start_waits_for_the_socket_and_stop_ends_both_daemons
+FAILED tools/tests/test_vk_external_image_sync.py::VkExternalImageSyncTest::test_client_barrier_pair
+FAILED tools/tests/test_xclipse_layer.py::XclipseLayerTest::test_layer_against_a_mock_loader_and_driver
+3 failed, 2080 passed, 98 skipped, 1 deselected, 5 warnings, 19716 subtests passed in 386.94s (0:06:26)

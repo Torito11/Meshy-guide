@@ -1,0 +1,19 @@
+# Enlaces del runtime de Valve: antes (cada arranque) / ahora (primera vez y siguientes). Contenedor x86-64, 800 enlaces, 200 podados.
+## old.sh
+srt_libs=$B/out; rm -rf "$srt_libs"; mkdir -p "$srt_libs"
+for d in $B/plat/lib $B/plat/usrlib; do for f in "$d"/*.so*; do [ -e "$srt_libs/$(basename "$f")" ] || ln -s "$f" "$srt_libs/"; done; done
+for f in "$srt_libs"/*; do n=$(basename "$f"); if [ -e "$B/rootfs/usr/lib/x86_64-linux-gnu/$n" ]; then rm -f "$f"; fi; done
+## new.sh
+srt_libs=$B/out; stamp="x $(stat -c %Y $B/plat/lib) $(stat -c %Y $B/plat/usrlib)"
+if [ "$(cat "$srt_libs/.droiddeck-stamp" 2>/dev/null)" != "$stamp" ]; then
+rm -rf "$srt_libs"; mkdir -p "$srt_libs"
+for d in $B/plat/lib $B/plat/usrlib; do for f in "$d"/*.so*; do [ -e "$srt_libs/${f##*/}" ] || ln -s "$f" "$srt_libs/"; done; done
+for f in "$srt_libs"/*; do n=${f##*/}; if [ -e "$B/rootfs/usr/lib/x86_64-linux-gnu/$n" ]; then rm -f "$f"; fi; done
+printf '%s' "$stamp" > "$srt_libs/.droiddeck-stamp"; fi
+## new2.sh
+srt_libs=$B/out; rm -rf "$srt_libs"; mkdir -p "$srt_libs"
+for d in $B/plat/lib $B/plat/usrlib; do srt_files=("$d"/*.so*); [ -e "${srt_files[0]}" ] && { ln -s "${srt_files[@]}" "$srt_libs/" 2>/dev/null || true; }; done
+srt_prune=(); for f in "$srt_libs"/*; do n=${f##*/}; if [ -e "$B/rootfs/usr/lib/x86_64-linux-gnu/$n" ]; then srt_prune+=("$f"); fi; done
+[ "${#srt_prune[@]}" -gt 0 ] && rm -f "${srt_prune[@]}"
+
+Resultados: antes 5899 ms; ahora reconstruyendo 143 ms (new2: una llamada ln/rm por directorio); ahora sin cambios 9 ms

@@ -1,0 +1,1503 @@
+From c27fdb59903f343dff5255ca51560f4faeebb467 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 21 Nov 2026 15:15:59 +0000
+Subject: [PATCH 15/16] feat(xcloud): latency-based region, automatic quality
+ and real stream statistics
+
+- Region: "Lowest measured latency" times a TCP connection to the gateway
+  of each region Microsoft's login offers this account (five samples,
+  DNS excluded) and only leaves Microsoft's default for a region that
+  answers at least 15 ms and 15 % faster; kept 20 minutes. Nothing is
+  added to the region list and the sign-in is untouched.
+- Statistics: both players read WebRTC's own getStats() every 2 s
+  (resolution, fps, codec, round trip, jitter, packet loss, bitrate,
+  decode time, dropped frames, region, state). The web player gets them
+  from the peer connection player.js creates, through a document-start
+  script; player.js is unchanged. The last stream and a short history
+  are saved and shown in a new Statistics section of the Xbox Cloud
+  settings, with the measured latency per region and the phone's H.264
+  decoder. Values WebRTC does not report show as unknown.
+- Automatic quality (on unless a bitrate limit is set): after a stream
+  that lost over 2 % of its packets the next is capped at 80 % of the
+  rate it reached; clean streams raise the cap again.
+- Performance and Xbox Cloud profiles pick the lowest-latency region.
+
+Diagnostics and downloads:
+- The shared logs get timings.txt (also for a start that never reached
+  the screen), memory.txt (memory and thermal state) and the x86-64
+  launcher's log with its renderer choice.
+- A start that takes over 90 s offers "Share logs" on the loading
+  screen while it still runs.
+- The ARMv8.0 Proton download shows its real size on disk on the loading
+  screen; an interrupted download resumes (tested against a local
+  server with ranges).
+- The Performance profile is called "Maximum safe performance".
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../com/droiddeck/launcher/SessionActivity.kt |   1 +
+ .../launcher/core/PerformanceProfiles.kt      |  14 +-
+ .../launcher/session/DiagnosticsExtras.kt     |  86 +++++++++
+ .../launcher/session/LoadingState.kt          |   4 +
+ .../launcher/session/SessionLogShare.kt       |   3 +-
+ .../launcher/stores/xbox/XboxCloudNetwork.kt  | 112 ++++++++++++
+ .../stores/xbox/XboxCloudPlayerActivity.kt    |  50 +++++-
+ .../launcher/stores/xbox/XboxCloudSettings.kt |   5 +
+ .../stores/xbox/XboxCloudSettingsPanel.kt     |  14 +-
+ .../launcher/stores/xbox/XboxCloudStats.kt    | 168 ++++++++++++++++++
+ .../stores/xbox/XboxCloudStatsPanel.kt        | 131 ++++++++++++++
+ .../stores/xbox/XboxNativePlayerActivity.kt   |  39 +++-
+ .../droiddeck/launcher/ui/SessionLoading.kt   |  23 +++
+ app/src/main/res/values-b+es+419/strings.xml  |  41 ++++-
+ app/src/main/res/values-es/strings.xml        |  41 ++++-
+ app/src/main/res/values/strings.xml           |  41 ++++-
+ .../launcher/session/DiagnosticsExtrasTest.kt |  39 ++++
+ .../stores/xbox/XboxCloudStatsTest.kt         |  98 ++++++++++
+ .../usr/local/bin/droiddeck-proton-armv80     |  35 +++-
+ tools/tests/test_armv80_download_resume.py    |  81 +++++++++
+ 20 files changed, 1005 insertions(+), 21 deletions(-)
+ create mode 100644 app/src/main/java/com/droiddeck/launcher/session/DiagnosticsExtras.kt
+ create mode 100644 app/src/main/java/com/droiddeck/launcher/stores/xbox/XboxCloudNetwork.kt
+ create mode 100644 app/src/main/java/com/droiddeck/launcher/stores/xbox/XboxCloudStats.kt
+ create mode 100644 app/src/main/java/com/droiddeck/launcher/stores/xbox/XboxCloudStatsPanel.kt
+ create mode 100644 app/src/test/java/com/droiddeck/launcher/session/DiagnosticsExtrasTest.kt
+ create mode 100644 app/src/test/java/com/droiddeck/launcher/stores/xbox/XboxCloudStatsTest.kt
+ create mode 100644 tools/tests/test_armv80_download_resume.py
+
+diff --git a/app/src/main/java/com/droiddeck/launcher/SessionActivity.kt b/app/src/main/java/com/droiddeck/launcher/SessionActivity.kt
+index c98c616..791b383 100644
+--- a/app/src/main/java/com/droiddeck/launcher/SessionActivity.kt
++++ b/app/src/main/java/com/droiddeck/launcher/SessionActivity.kt
+@@ -1025,6 +1025,7 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
+                     onRepair = if (repairOffered) ({ repairRuntime() }) else null,
+                     onShareLogs = { shareCurrentSessionLogs() },
+                     onClose = { finish() },
++                    longWait = loading.longWait,
+                     flood = floodColor?.let { androidx.compose.ui.graphics.Color(it) },
+                     onFlooded = {
+                         floodColor = null
+diff --git a/app/src/main/java/com/droiddeck/launcher/core/PerformanceProfiles.kt b/app/src/main/java/com/droiddeck/launcher/core/PerformanceProfiles.kt
+index 8d751c6..c2d8c49 100644
+--- a/app/src/main/java/com/droiddeck/launcher/core/PerformanceProfiles.kt
++++ b/app/src/main/java/com/droiddeck/launcher/core/PerformanceProfiles.kt
+@@ -28,6 +28,8 @@ object PerformanceProfiles {
+     /** Xbox Cloud settings a profile sets; null leaves the current value. */
+     data class Cloud(
+         val playerEngine: String? = null,
++        val region: String? = null,
++        val autoQuality: Boolean? = null,
+         val resolution: String? = null,
+         val fpsLimit: Int? = null,
+         val bitrateMbps: Int? = null,
+@@ -37,7 +39,8 @@ object PerformanceProfiles {
+         val zeroCopy: Boolean? = null,
+     ) {
+         fun applyTo(s: XboxCloudSettings) = s.copy(
+-            playerEngine = playerEngine ?: s.playerEngine, resolution = resolution ?: s.resolution,
++            playerEngine = playerEngine ?: s.playerEngine, region = region ?: s.region, autoQuality = autoQuality ?: s.autoQuality,
++            resolution = resolution ?: s.resolution,
+             fpsLimit = fpsLimit ?: s.fpsLimit, fpsCustomOn = if (fpsLimit != null) false else s.fpsCustomOn,
+             bitrateMbps = bitrateMbps ?: s.bitrateMbps, frameGen = frameGen ?: s.frameGen,
+             smallBuffer = smallBuffer ?: s.smallBuffer, fastDecoder = fastDecoder ?: s.fastDecoder, zeroCopy = zeroCopy ?: s.zeroCopy,
+@@ -76,12 +79,13 @@ object PerformanceProfiles {
+             // no background shader compiling on a low-tier GPU; the stream takes the lowest-latency path.
+             PERFORMANCE -> Plan(refreshCap = cap60, fexPreset = FEX_DEFAULT, clientCores = little, pinGamescope = false,
+                 gameThreadHints = true, shaderPrecache = if (lowTier) false else null,
+-                cloud = Cloud(fpsLimit = 0, frameGen = noFrameGen, smallBuffer = true, fastDecoder = true, zeroCopy = true))
++                cloud = Cloud(region = XboxCloudSettings.REGION_LOWEST_LATENCY, autoQuality = true, fpsLimit = 0, frameGen = noFrameGen,
++                    smallBuffer = true, fastDecoder = true, zeroCopy = true))
+             // Half the frames (30 Hz session, an exact divisor of 60 Hz), everything but the game on the efficiency
+             // cluster, no background work, a 720p stream at 8 Mb/s with the screen at 60 Hz.
+             BATTERY -> Plan(refreshCap = 30, fexPreset = FEX_DEFAULT, clientCores = little, pinGamescope = true,
+                 gameThreadHints = false, shaderPrecache = false, steamDownloadsInBackground = false,
+-                cloud = Cloud(resolution = "720p", fpsLimit = 60, bitrateMbps = 8, frameGen = XboxNativeVideo.FG_OFF,
++                cloud = Cloud(autoQuality = true, resolution = "720p", fpsLimit = 60, bitrateMbps = 8, frameGen = XboxNativeVideo.FG_OFF,
+                     smallBuffer = false, fastDecoder = true))
+             // FEX keeps x86 memory ordering everywhere (vector and memcpy included) and full x87 precision: slower,
+             // for games that crash or glitch otherwise. The stream uses the web engine with normal buffering.
+@@ -93,8 +97,8 @@ object PerformanceProfiles {
+             XBOX -> Plan(refreshCap = if (lowTier) 30 else 0, fexPreset = FEX_DEFAULT, clientCores = little, pinGamescope = false,
+                 gameThreadHints = true, shaderPrecache = if (lowTier) false else null)
+             // Streaming only: the console renders, this device decodes. Best picture the panel shows, lowest latency.
+-            XBOX_CLOUD -> Plan(cloud = Cloud(resolution = "1080p", fpsLimit = 0, bitrateMbps = 0, frameGen = noFrameGen,
+-                smallBuffer = true, fastDecoder = true, zeroCopy = true))
++            XBOX_CLOUD -> Plan(cloud = Cloud(region = XboxCloudSettings.REGION_LOWEST_LATENCY, autoQuality = true, resolution = "1080p",
++                fpsLimit = 0, bitrateMbps = 0, frameGen = noFrameGen, smallBuffer = true, fastDecoder = true, zeroCopy = true))
+             STEAM -> Plan(refreshCap = cap60, fexPreset = FEX_DEFAULT, clientCores = little, pinGamescope = false,
+                 gameThreadHints = true, shaderPrecache = if (lowTier) false else null)
+             else -> Plan()
+diff --git a/app/src/main/java/com/droiddeck/launcher/session/DiagnosticsExtras.kt b/app/src/main/java/com/droiddeck/launcher/session/DiagnosticsExtras.kt
+new file mode 100644
+index 0000000..3cbcd5d
+--- /dev/null
++++ b/app/src/main/java/com/droiddeck/launcher/session/DiagnosticsExtras.kt
+@@ -0,0 +1,86 @@
++package com.droiddeck.launcher.session
++
++import android.app.ActivityManager
++import android.content.Context
++import android.os.Build
++import android.os.PowerManager
++import com.droiddeck.launcher.runtime.LinuxRuntime
++import org.json.JSONObject
++import java.io.File
++import java.io.RandomAccessFile
++
++/**
++ * Files the shared logs ZIP gets in addition to the session folder, written just before it is packed (the ZIP's own
++ * redaction then applies to them like to every other file): start-up times (also for a start that never reached the
++ * screen), memory and thermal state, and the x86-64 client launcher's own log with its renderer choice.
++ */
++object DiagnosticsExtras {
++    private const val TAIL = 2L * 1024 * 1024
++
++    fun write(context: Context, dir: File) {
++        runCatching { File(dir, "timings.txt").writeText(sessionReport(dir) + "\n" + StartupTimes.describe(context)) }
++        runCatching { File(dir, "memory.txt").writeText(memory(context)) }
++        runCatching {
++            val home = File(LinuxRuntime.rootDir(context), "root/.droiddeck-x64")
++            val out = File(dir, "steam-x64").apply { mkdirs() }
++            tail(File(home, "steam-x64.log"), File(out, "steam-x64.log"))
++            for (name in listOf(".droiddeck-cef-software", ".droiddeck-client-ok")) {
++                File(home, name).takeIf { it.isFile }?.copyTo(File(out, name.trimStart('.') + ".txt"), overwrite = true)
++            }
++            if (out.list().isNullOrEmpty()) out.delete()
++        }
++    }
++
++    /** This session's phases so far, with what it is still waiting for. */
++    internal fun sessionReport(dir: File, now: Long = System.currentTimeMillis()): String {
++        val events = File(dir, "events.jsonl").takeIf { it.isFile }?.readLines()
++            ?.mapNotNull { runCatching { JSONObject(it) }.getOrNull() }.orEmpty()
++        val created = events.firstOrNull { it.optString("event") == "session.created" }?.optLong("t") ?: return "This session: no events.\n"
++        val log = File(dir, "session.log").takeIf { it.isFile }?.let { readTail(it, 512 * 1024) }.orEmpty()
++        val steps = StartupTimes.steps(log, created)
++        val phases = StartupTimes.sessionPhases(events, steps)
++        val sb = StringBuilder("This session (ms): ")
++        sb.append(phases.entries.joinToString { "${it.key}=${it.value}" }.ifEmpty { "nothing measured yet" })
++        if ("total_ms" !in phases) {
++            val steam = steps.lastOrNull { it.text.startsWith("starting the Steam client") }
++            sb.append(if (steam != null) "; Steam started ${(now - steam.atMs) / 1000} s ago and has not reached the screen"
++                else "; ${(now - created) / 1000} s since Play, Steam not started yet")
++            steps.lastOrNull()?.let { sb.append("; last step: ").append(it.text.take(200)) }
++        }
++        if (StartupTimes.firstStart(steps)) sb.append(" (first start: something was downloaded or installed)")
++        return sb.append('\n').toString()
++    }
++
++    internal fun memory(context: Context): String {
++        val sb = StringBuilder()
++        val am = context.getSystemService(ActivityManager::class.java)
++        if (am != null) {
++            val info = ActivityManager.MemoryInfo().also { am.getMemoryInfo(it) }
++            sb.append("Android: total ${info.totalMem shr 20} MB, available ${info.availMem shr 20} MB, low-memory threshold ")
++                .append("${info.threshold shr 20} MB, low memory now: ${info.lowMemory}\n")
++        }
++        if (Build.VERSION.SDK_INT >= 29) runCatching {
++            val pm = context.getSystemService(PowerManager::class.java)
++            sb.append("Thermal status: ${com.droiddeck.launcher.core.DeviceReport.thermalStatusName(pm.currentThermalStatus)}\n")
++        }
++        runCatching {
++            File("/proc/meminfo").readLines().filter { line ->
++                listOf("MemTotal", "MemFree", "MemAvailable", "Cached", "SwapTotal", "SwapFree", "Shmem").any { line.startsWith("$it:") }
++            }.forEach { sb.append(it).append('\n') }
++        }
++        return sb.toString()
++    }
++
++    private fun tail(src: File, dst: File) {
++        if (!src.isFile) return
++        dst.writeText(readTail(src, TAIL))
++    }
++
++    private fun readTail(file: File, bytes: Long): String = RandomAccessFile(file, "r").use { f ->
++        val start = (f.length() - bytes).coerceAtLeast(0)
++        f.seek(start)
++        val buf = ByteArray((f.length() - start).toInt())
++        f.readFully(buf)
++        String(buf, Charsets.UTF_8)
++    }
++}
+diff --git a/app/src/main/java/com/droiddeck/launcher/session/LoadingState.kt b/app/src/main/java/com/droiddeck/launcher/session/LoadingState.kt
+index 11e3b98..b9aedf0 100644
+--- a/app/src/main/java/com/droiddeck/launcher/session/LoadingState.kt
++++ b/app/src/main/java/com/droiddeck/launcher/session/LoadingState.kt
+@@ -23,6 +23,9 @@ class LoadingState(context: Context, private val steam: Boolean = true) {
+     var hint by mutableStateOf("")
+     var ended by mutableStateOf(false)
+     var endedDetail by mutableStateOf<String?>(null)
++    /** Over 90 s without reaching the screen: the loading screen offers sharing the logs while it waits. */
++    var longWait by mutableStateOf(false)
++        private set
+ 
+     private val hints = context.resources.getStringArray(
+         if (steam) com.droiddeck.launcher.R.array.loading_hints else com.droiddeck.launcher.R.array.loading_hints_desktop,
+@@ -34,6 +37,7 @@ class LoadingState(context: Context, private val steam: Boolean = true) {
+         val seconds = (SystemClock.elapsedRealtime() - startedAt) / 1000
+         elapsed = res.getString(com.droiddeck.launcher.R.string.loadstate_elapsed, seconds / 60, seconds % 60)
+         hint = hints[((seconds / 8) % hints.size).toInt()]
++        longWait = seconds >= 90
+     }
+ 
+     fun say(line: String, topic: Topic, readable: Boolean) {
+diff --git a/app/src/main/java/com/droiddeck/launcher/session/SessionLogShare.kt b/app/src/main/java/com/droiddeck/launcher/session/SessionLogShare.kt
+index cde58c9..cdeffc7 100644
+--- a/app/src/main/java/com/droiddeck/launcher/session/SessionLogShare.kt
++++ b/app/src/main/java/com/droiddeck/launcher/session/SessionLogShare.kt
+@@ -26,7 +26,7 @@ object SessionLogShare {
+         if (progress != null) return
+         progress = 0f
+         Thread({
+-            val zip = runCatching { folder()?.let { dir -> zipFolder(context, dir) { p -> main.post { if (progress != null) progress = p } } } }
++            val zip = runCatching { folder()?.let { dir -> DiagnosticsExtras.write(context, dir); zipFolder(context, dir) { p -> main.post { if (progress != null) progress = p } } } }
+                 .onFailure { Log.w("SessionLogShare", "could not package session logs", it) }
+                 .getOrNull()
+             main.post { progress = null; done(zip) }
+@@ -64,6 +64,7 @@ object SessionLogShare {
+         Thread({
+             val zips = runCatching {
+                 folder()?.let { dir ->
++                    DiagnosticsExtras.write(context, dir)
+                     EnhancedSessionLogShare.create(context, dir, onProgress = { p ->
+                         main.post { if (progress != null) progress = p }
+                     })
+diff --git a/app/src/main/java/com/droiddeck/launcher/stores/xbox/XboxCloudNetwork.kt b/app/src/main/java/com/droiddeck/launcher/stores/xbox/XboxCloudNetwork.kt
+new file mode 100644
+index 0000000..3dc0d13
+--- /dev/null
++++ b/app/src/main/java/com/droiddeck/launcher/stores/xbox/XboxCloudNetwork.kt
+@@ -0,0 +1,112 @@
++package com.droiddeck.launcher.stores.xbox
++
++import android.content.Context
++import org.json.JSONArray
++import org.json.JSONObject
++import java.net.InetAddress
++import java.net.InetSocketAddress
++import java.net.Socket
++import java.util.concurrent.Executors
++import java.util.concurrent.TimeUnit
++import kotlin.math.roundToInt
++
++/**
++ * Round-trip time from this device to each region Microsoft offers this account (the login's own region list,
++ * nothing added): a TCP connection to the region's gateway, five times, DNS resolved beforehand so it is not
++ * counted. Another region than Microsoft's default is only chosen when it answers clearly faster, so a region far
++ * away is never picked for a millisecond or two. Results are kept 20 minutes.
++ */
++internal object XboxCloudNetwork {
++    private const val PREFS = "xbox_cloud_stats"
++    private const val PROBE = "probe"
++    private const val FRESH_MS = 20 * 60_000L
++    const val MIN_GAIN_MS = 15
++    const val MIN_GAIN_SHARE = 0.15
++
++    data class Probe(val region: String, val isDefault: Boolean, val medianMs: Int?, val spreadMs: Int?, val failures: Int)
++
++    fun probe(regions: List<XboxCloudSession.Region>, samples: Int = 5, timeoutMs: Int = 2000): List<Probe> {
++        if (regions.isEmpty()) return emptyList()
++        val pool = Executors.newFixedThreadPool(regions.size.coerceIn(1, 6))
++        try {
++            val futures = regions.map { region -> pool.submit<Probe> { probeOne(region, samples, timeoutMs) } }
++            return futures.mapIndexed { i, f ->
++                runCatching { f.get(samples.toLong() * timeoutMs + 5000, TimeUnit.MILLISECONDS) }
++                    .getOrElse { Probe(regions[i].name, regions[i].isDefault, null, null, samples) }
++            }
++        } finally {
++            pool.shutdownNow()
++        }
++    }
++
++    private fun probeOne(region: XboxCloudSession.Region, samples: Int, timeoutMs: Int): Probe {
++        val uri = runCatching { java.net.URI(region.baseUri) }.getOrNull()
++        val host = uri?.host ?: return Probe(region.name, region.isDefault, null, null, samples)
++        val port = uri.port.takeIf { it > 0 } ?: 443
++        val address = runCatching { InetAddress.getByName(host) }.getOrNull() ?: return Probe(region.name, region.isDefault, null, null, samples)
++        val times = ArrayList<Double>()
++        var failures = 0
++        repeat(samples) {
++            val socket = Socket()
++            val started = System.nanoTime()
++            try {
++                socket.connect(InetSocketAddress(address, port), timeoutMs)
++                times += (System.nanoTime() - started) / 1e6
++            } catch (_: Exception) {
++                failures++
++            } finally {
++                runCatching { socket.close() }
++            }
++        }
++        return summarize(region.name, region.isDefault, times, failures)
++    }
++
++    internal fun summarize(name: String, isDefault: Boolean, times: List<Double>, failures: Int): Probe {
++        if (times.isEmpty()) return Probe(name, isDefault, null, null, failures)
++        val sorted = times.sorted()
++        return Probe(name, isDefault, sorted[sorted.size / 2].roundToInt(), (sorted.last() - sorted.first()).roundToInt(), failures)
++    }
++
++    /** Microsoft's default region unless another answered at least [MIN_GAIN_MS] and [MIN_GAIN_SHARE] faster. */
++    fun choose(probes: List<Probe>): Probe? {
++        val default = probes.firstOrNull { it.isDefault } ?: probes.firstOrNull()
++        val usable = probes.filter { it.medianMs != null && it.failures <= 1 }
++        val best = usable.minByOrNull { it.medianMs!! } ?: return default
++        val baseline = default?.takeIf { it.medianMs != null && it.failures <= 1 }?.medianMs ?: return best
++        val gain = baseline - best.medianMs!!
++        return if (gain >= MIN_GAIN_MS && gain >= baseline * MIN_GAIN_SHARE) best else default
++    }
++
++    /** The region name to stream from with "lowest measured latency"; measures again after 20 minutes. */
++    fun bestRegion(context: Context, regions: List<XboxCloudSession.Region>, log: (String) -> Unit = {}): String? {
++        val names = regions.map { it.name }.toSet()
++        val cached = saved(context)?.takeIf { (at, probes) ->
++            System.currentTimeMillis() - at in 0 until FRESH_MS && probes.map { it.region }.toSet() == names
++        }?.second
++        val probes = cached ?: probe(regions).also { save(context, it) }
++        val chosen = choose(probes)
++        log("regions by latency: " + probes.joinToString { "${it.region}${if (it.isDefault) "*" else ""} ${it.medianMs?.let { ms -> "$ms ms" } ?: "no answer"}" } +
++            " -> ${chosen?.region ?: "Microsoft's default"}" + if (cached != null) " (measured earlier)" else "")
++        return chosen?.region
++    }
++
++    fun save(context: Context, probes: List<Probe>) {
++        val array = JSONArray(probes.map {
++            JSONObject().put("region", it.region).put("isDefault", it.isDefault).put("medianMs", it.medianMs ?: JSONObject.NULL)
++                .put("spreadMs", it.spreadMs ?: JSONObject.NULL).put("failures", it.failures)
++        })
++        runCatching {
++            context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
++                .putString(PROBE, JSONObject().put("at", System.currentTimeMillis()).put("probes", array).toString()).apply()
++        }
++    }
++
++    fun saved(context: Context): Pair<Long, List<Probe>>? = runCatching {
++        val o = JSONObject(context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getString(PROBE, null) ?: return null)
++        val array = o.getJSONArray("probes")
++        o.getLong("at") to (0 until array.length()).map { array.getJSONObject(it) }.map {
++            Probe(it.getString("region"), it.optBoolean("isDefault"), if (it.isNull("medianMs")) null else it.optInt("medianMs"),
++                if (it.isNull("spreadMs")) null else it.optInt("spreadMs"), it.optInt("failures"))
++        }
++    }.getOrNull()
++}
+diff --git a/app/src/main/java/com/droiddeck/launcher/stores/xbox/XboxCloudPlayerActivity.kt b/app/src/main/java/com/droiddeck/launcher/stores/xbox/XboxCloudPlayerActivity.kt
+index effbbb1..b2077e9 100644
+--- a/app/src/main/java/com/droiddeck/launcher/stores/xbox/XboxCloudPlayerActivity.kt
++++ b/app/src/main/java/com/droiddeck/launcher/stores/xbox/XboxCloudPlayerActivity.kt
+@@ -57,6 +57,9 @@ class XboxCloudPlayerActivity : ComponentActivity() {
+     @Volatile private var settings = XboxCloudSettings()
+     @Volatile private var sessionSignals: XboxCloudSignalling? = null
+     @Volatile private var startedWith: XboxCloudSettings? = null
++    private val statsReader = XboxCloudStats.Reader("web")
++    @Volatile private var autoCap = 0
++    @Volatile private var serverName: String? = null
+     private var menu: androidx.compose.ui.platform.ComposeView? = null
+ 
+     @SuppressLint("SetJavaScriptEnabled")
+@@ -79,7 +82,12 @@ class XboxCloudPlayerActivity : ComponentActivity() {
+                 val title = XboxCloudSession.titles(active)[product] ?: error("This game can't be streamed with this account here.")
+                 settings = XboxCloudSettings.load(applicationContext)
+                 startedWith = settings
+-                session = active.forStream(settings.region, settings.osName); titleId = title
++                val regionName = if (settings.region == XboxCloudSettings.REGION_LOWEST_LATENCY)
++                    XboxCloudNetwork.bestRegion(applicationContext, active.regionList) { diag("cloud player: $it") }.orEmpty() else settings.region
++                session = active.forStream(regionName, settings.osName); titleId = title
++                serverName = session?.let { s -> s.regionList.firstOrNull { it.baseUri == s.baseUri }?.name }
++                autoCap = if (settings.autoQuality && settings.bitrateMbps == 0) XboxCloudStats.autoCap(XboxCloudStats.history(applicationContext)) else 0
++                if (autoCap > 0) diag("cloud player: automatic quality, bitrate limit $autoCap Mb/s after the last stream")
+                 diag("cloud player: $product -> title $title, region ${java.net.URI(session!!.baseUri).host}, transfer=${active.userToken != null}")
+             }
+             runOnUiThread {
+@@ -108,6 +116,10 @@ class XboxCloudPlayerActivity : ComponentActivity() {
+         view.isFocusable = true
+         view.isFocusableInTouchMode = true
+         view.addJavascriptInterface(Bridge(), "DDCloud")
++        // WebRTC's own statistics for the settings page, from the peer connection player.js creates (player.js is unchanged).
++        if (androidx.webkit.WebViewFeature.isFeatureSupported(androidx.webkit.WebViewFeature.DOCUMENT_START_SCRIPT)) runCatching {
++            androidx.webkit.WebViewCompat.addDocumentStartJavaScript(view, STATS_SHIM, setOf("https://appassets.androidplatform.net"))
++        }
+         view.webViewClient = object : WebViewClient() {
+             override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest): WebResourceResponse? =
+                 loader.shouldInterceptRequest(request.url)
+@@ -140,6 +152,15 @@ class XboxCloudPlayerActivity : ComponentActivity() {
+         @JavascriptInterface
+         fun status(text: String) { android.util.Log.i("XboxCloudPlayer", "status: ${text.take(120)}") }
+ 
++        @JavascriptInterface
++        fun stats(json: String, state: String) {
++            if (closed || json.length > 200_000) return
++            val entries = runCatching { XboxCloudStats.entries(json) }.getOrNull() ?: return
++            val cap = if (settings.bitrateMbps > 0) settings.bitrateMbps else autoCap
++            val shown = when (state) { "connected" -> "streaming"; "disconnected" -> "reconnecting"; "" -> "connecting"; else -> state }
++            XboxCloudStats.update(applicationContext, statsReader.read(entries, serverName, shown, cap))
++        }
++
+         @JavascriptInterface
+         fun playing() {
+             diag("cloud player streaming")
+@@ -348,6 +369,7 @@ class XboxCloudPlayerActivity : ComponentActivity() {
+     }
+ 
+     private fun pageSettings(s: XboxCloudSettings): String = JSONObject(s.toJson())
++        .apply { if (s.bitrateMbps == 0 && autoCap > 0) put("bitrateMbps", autoCap) }
+         .put("server", session?.let { active -> active.regionList.firstOrNull { it.baseUri == active.baseUri }?.name } ?: "").toString()
+ 
+     private var lastMainEntry = 0
+@@ -377,6 +399,7 @@ class XboxCloudPlayerActivity : ComponentActivity() {
+     }
+ 
+     override fun onDestroy() {
++        XboxCloudStats.ended(applicationContext, statsReader.summary(serverName, if (settings.bitrateMbps > 0) settings.bitrateMbps else autoCap))
+         closed = true
+         web?.let { it.evaluateJavascript("window.__ddStop && window.__ddStop()", null); root.removeView(it); it.destroy() }
+         web = null
+@@ -392,6 +415,31 @@ class XboxCloudPlayerActivity : ComponentActivity() {
+     private fun diag(text: String) = StoresState.logLine("Xbox: $text")
+ 
+     companion object {
++        private const val STATS_SHIM = """(function () {
++  if (window.__ddStatsShim || !window.RTCPeerConnection) return;
++  window.__ddStatsShim = true;
++  var Native = window.RTCPeerConnection, pcs = [];
++  function Wrapped(a, b) { var pc = new Native(a, b); pcs.push(pc); return pc; }
++  Wrapped.prototype = Native.prototype;
++  Object.setPrototypeOf(Wrapped, Native);
++  window.RTCPeerConnection = Wrapped;
++  var keep = {"inbound-rtp": ["kind", "mediaType", "frameWidth", "frameHeight", "framesPerSecond", "codecId", "bytesReceived",
++      "packetsLost", "packetsReceived", "jitter", "totalDecodeTime", "framesDecoded", "framesDropped"],
++    "codec": ["mimeType"], "candidate-pair": ["state", "nominated", "currentRoundTripTime"]};
++  setInterval(function () {
++    var pc = pcs[pcs.length - 1];
++    if (!pc || pc.connectionState === "closed" || !window.DDCloud || !window.DDCloud.stats) return;
++    pc.getStats().then(function (report) {
++      var out = [];
++      report.forEach(function (s) {
++        var k = keep[s.type]; if (!k) return;
++        var m = {}; k.forEach(function (f) { if (s[f] !== undefined) m[f] = s[f]; });
++        out.push({type: s.type, id: s.id, timestamp: s.timestamp, members: m});
++      });
++      window.DDCloud.stats(JSON.stringify(out), pc.connectionState || "");
++    }).catch(function () {});
++  }, 2000);
++})();"""
+         private const val DOUBLE_PRESS_MS = 350L
+ 
+         fun intent(context: Context, productId: String, title: String): Intent = Intent(context, XboxCloudPlayerActivity::class.java)
+diff --git a/app/src/main/java/com/droiddeck/launcher/stores/xbox/XboxCloudSettings.kt b/app/src/main/java/com/droiddeck/launcher/stores/xbox/XboxCloudSettings.kt
+index 475838f..1c12464 100644
+--- a/app/src/main/java/com/droiddeck/launcher/stores/xbox/XboxCloudSettings.kt
++++ b/app/src/main/java/com/droiddeck/launcher/stores/xbox/XboxCloudSettings.kt
+@@ -36,6 +36,7 @@ data class XboxCloudSettings(
+     val smallBuffer: Boolean = false,
+     val fastDecoder: Boolean = true,
+     val zeroCopy: Boolean = false,
++    val autoQuality: Boolean = true,
+ ) {
+     val fpsTarget get() = if (fpsCustomOn) fpsCustom else fpsLimit
+ 
+@@ -50,12 +51,15 @@ data class XboxCloudSettings(
+         .put("playerEngine", playerEngine).put("frameGen", frameGen)
+         .put("fpsLimit", fpsLimit).put("fpsCustomOn", fpsCustomOn).put("fpsCustom", fpsCustom)
+         .put("instantInput", instantInput).put("smallBuffer", smallBuffer).put("fastDecoder", fastDecoder).put("zeroCopy", zeroCopy)
++        .put("autoQuality", autoQuality)
+         .toString()
+ 
+     fun withoutEffects() = copy(brightness = 0, contrast = 0, gamma = 1f, saturation = 100, sharpen = 0, sharpenMode = "cas",
+         deband = 0, fxaa = false, toon = false, crt = false, ntsc = false)
+ 
+     companion object {
++        /** Region setting: the region Microsoft offers that answers fastest from here (see XboxCloudNetwork). */
++        const val REGION_LOWEST_LATENCY = "lowest-latency"
+         private const val PREFS = "xbox_cloud"
+         private const val KEY = "settings"
+ 
+@@ -98,6 +102,7 @@ data class XboxCloudSettings(
+                 fpsCustom = json.optInt("fpsCustom", d.fpsCustom).coerceIn(10, 165),
+                 instantInput = json.optBoolean("instantInput", d.instantInput), smallBuffer = json.optBoolean("smallBuffer", d.smallBuffer),
+                 fastDecoder = json.optBoolean("fastDecoder", d.fastDecoder), zeroCopy = json.optBoolean("zeroCopy", d.zeroCopy),
++                autoQuality = json.optBoolean("autoQuality", d.autoQuality),
+             )
+         }.getOrDefault(XboxCloudSettings())
+ 
+diff --git a/app/src/main/java/com/droiddeck/launcher/stores/xbox/XboxCloudSettingsPanel.kt b/app/src/main/java/com/droiddeck/launcher/stores/xbox/XboxCloudSettingsPanel.kt
+index b4f9ab9..5912e2a 100644
+--- a/app/src/main/java/com/droiddeck/launcher/stores/xbox/XboxCloudSettingsPanel.kt
++++ b/app/src/main/java/com/droiddeck/launcher/stores/xbox/XboxCloudSettingsPanel.kt
+@@ -112,7 +112,10 @@ private fun PanelContent(
+         }
+         Choice("Resolution", listOf("720p" to "720p (phone)", "1080p" to "Best (PC)", "1080p_hq" to "1080p HQ (TV)"),
+             settings.resolution, pending { it.resolution != settings.resolution }) { onChange(settings.copy(resolution = it)) }
+-        Choice("Server region", listOf("" to "Automatic") + regions.map { it to it }, settings.region,
++        Choice(androidx.compose.ui.res.stringResource(com.droiddeck.launcher.R.string.xcloud_region_label),
++            listOf("" to androidx.compose.ui.res.stringResource(com.droiddeck.launcher.R.string.xcloud_region_microsoft),
++                XboxCloudSettings.REGION_LOWEST_LATENCY to androidx.compose.ui.res.stringResource(com.droiddeck.launcher.R.string.xcloud_region_lowest)) +
++                regions.map { it to it }, settings.region,
+             pending { it.region != settings.region }) { onChange(settings.copy(region = it)) }
+         Choice("Game language", XboxCloudSettings.LANGUAGES, settings.language,
+             pending { it.language != settings.language }) { onChange(settings.copy(language = it)) }
+@@ -120,6 +123,10 @@ private fun PanelContent(
+             pending { it.codec != settings.codec }) { onChange(settings.copy(codec = it)) }
+         Choice("Bitrate limit", listOf(0 to "No limit") + listOf(5, 8, 10, 12, 15, 20, 25, 30, 40, 50).map { it to "$it Mb/s" }, settings.bitrateMbps,
+             pending { it.bitrateMbps != settings.bitrateMbps }) { onChange(settings.copy(bitrateMbps = it)) }
++        Toggle(androidx.compose.ui.res.stringResource(com.droiddeck.launcher.R.string.xcloud_auto_quality),
++            androidx.compose.ui.res.stringResource(com.droiddeck.launcher.R.string.xcloud_auto_quality_hint), settings.autoQuality) {
++            onChange(settings.copy(autoQuality = it))
++        }
+         Toggle("Stop quality drops", "Keeps the resolution up when this device decodes slowly.", settings.preventDrops) { onChange(settings.copy(preventDrops = it)) }
+     }
+ 
+@@ -169,6 +176,11 @@ private fun PanelContent(
+             settings.zeroCopy) { onChange(settings.copy(zeroCopy = it)) }
+     }
+ 
++    if (section == null || section == "stats") Section(androidx.compose.ui.res.stringResource(com.droiddeck.launcher.R.string.xcloud_stats_title),
++        androidx.compose.ui.res.stringResource(com.droiddeck.launcher.R.string.xcloud_stats_note)) {
++        CloudStatsSection()
++    }
++
+     if (section == null || section == "overlay" || section == "overlay-native") Section("Overlay and sound", null) {
+         Choice("Performance overlay", listOf(0 to "Off", 1 to "FPS only", 2 to "Basic", 3 to "Detailed", 4 to "Full"), settings.statsLevel) {
+             onChange(settings.copy(statsLevel = it))
+diff --git a/app/src/main/java/com/droiddeck/launcher/stores/xbox/XboxCloudStats.kt b/app/src/main/java/com/droiddeck/launcher/stores/xbox/XboxCloudStats.kt
+new file mode 100644
+index 0000000..1927ecc
+--- /dev/null
++++ b/app/src/main/java/com/droiddeck/launcher/stores/xbox/XboxCloudStats.kt
+@@ -0,0 +1,168 @@
++package com.droiddeck.launcher.stores.xbox
++
++import android.content.Context
++import org.json.JSONArray
++import org.json.JSONObject
++import kotlin.math.roundToInt
++
++/**
++ * What a cloud stream measured, from WebRTC's own statistics (both players): resolution, frames per second,
++ * codec, round trip, network jitter, packet loss, bitrate, decode time, dropped frames, the region and the stream's
++ * state. Only values WebRTC reports are kept; a value it does not report stays null and is shown as unknown.
++ * The last stream and a short history are saved, for the settings page and for the next stream's automatic quality.
++ */
++internal object XboxCloudStats {
++    private const val PREFS = "xbox_cloud_stats"
++    private const val LAST = "last"
++    private const val HISTORY = "history"
++    private const val KEEP = 10
++
++    data class Snapshot(
++        val at: Long, val engine: String, val region: String?, val state: String,
++        val width: Int? = null, val height: Int? = null, val fps: Int? = null, val codec: String? = null,
++        val rttMs: Int? = null, val jitterMs: Int? = null, val lossPct: Double? = null, val mbps: Double? = null,
++        val decodeMs: Double? = null, val framesDropped: Long? = null, val capMbps: Int = 0,
++    ) {
++        fun toJson(): JSONObject = JSONObject().put("at", at).put("engine", engine).put("region", region ?: JSONObject.NULL)
++            .put("state", state).put("width", width ?: JSONObject.NULL).put("height", height ?: JSONObject.NULL)
++            .put("fps", fps ?: JSONObject.NULL).put("codec", codec ?: JSONObject.NULL).put("rttMs", rttMs ?: JSONObject.NULL)
++            .put("jitterMs", jitterMs ?: JSONObject.NULL).put("lossPct", lossPct ?: JSONObject.NULL).put("mbps", mbps ?: JSONObject.NULL)
++            .put("decodeMs", decodeMs ?: JSONObject.NULL).put("framesDropped", framesDropped ?: JSONObject.NULL).put("capMbps", capMbps)
++
++        companion object {
++            fun fromJson(o: JSONObject) = Snapshot(
++                o.optLong("at"), o.optString("engine"), o.optString("region").takeIf { !o.isNull("region") && it.isNotEmpty() },
++                o.optString("state"), o.intOrNull("width"), o.intOrNull("height"), o.intOrNull("fps"),
++                o.optString("codec").takeIf { !o.isNull("codec") && it.isNotEmpty() }, o.intOrNull("rttMs"), o.intOrNull("jitterMs"),
++                o.doubleOrNull("lossPct"), o.doubleOrNull("mbps"), o.doubleOrNull("decodeMs"),
++                if (o.isNull("framesDropped") || !o.has("framesDropped")) null else o.optLong("framesDropped"), o.optInt("capMbps"),
++            )
++        }
++    }
++
++    /** One stream's average, for the next stream's quality. */
++    data class Summary(val at: Long, val engine: String, val region: String?, val rttMs: Int?, val lossPct: Double?, val mbps: Double?, val capMbps: Int)
++
++    /** A WebRTC stats entry, as both players read it. Times in milliseconds. */
++    class Entry(val type: String, val id: String, val timestampMs: Double, val members: Map<String, Any?>)
++
++    /** Turns successive getStats() reports into snapshots; rates come from the change since the previous report. */
++    class Reader(private val engine: String) {
++        private var lastBytes = -1.0; private var lastMs = -1.0; private var lastLost = -1.0; private var lastReceived = -1.0
++        private var lastDecode = -1.0; private var lastDecoded = -1.0
++        private val rtts = ArrayList<Int>(); private val losses = ArrayList<Double>(); private val rates = ArrayList<Double>()
++
++        fun read(entries: List<Entry>, region: String?, state: String, capMbps: Int, now: Long = System.currentTimeMillis()): Snapshot {
++            val codecs = entries.filter { it.type == "codec" }.associate { it.id to (it.members["mimeType"] as? String).orEmpty().removePrefix("video/") }
++            val video = entries.firstOrNull { it.type == "inbound-rtp" && (it.members["kind"] ?: it.members["mediaType"]) == "video" }
++            val pair = entries.firstOrNull { it.type == "candidate-pair" && it.members["state"] == "succeeded" && it.members["nominated"] == true }
++            val rtt = (pair?.members?.get("currentRoundTripTime") as? Number)?.toDouble()?.let { (it * 1000).roundToInt() }
++            var mbps: Double? = null; var loss: Double? = null; var decodeMs: Double? = null
++            if (video != null) {
++                val m = video.members
++                val bytes = (m["bytesReceived"] as? Number)?.toDouble()
++                if (bytes != null) {
++                    if (lastBytes >= 0 && video.timestampMs > lastMs) mbps = (bytes - lastBytes) * 8 / ((video.timestampMs - lastMs) * 1000)
++                    lastBytes = bytes; lastMs = video.timestampMs
++                }
++                val lost = (m["packetsLost"] as? Number)?.toDouble(); val received = (m["packetsReceived"] as? Number)?.toDouble()
++                if (lost != null && received != null) {
++                    if (lastLost >= 0) { val dl = lost - lastLost; val dr = received - lastReceived; if (dl + dr > 0) loss = (dl * 100 / (dl + dr)).coerceIn(0.0, 100.0) }
++                    lastLost = lost; lastReceived = received
++                }
++                val dt = (m["totalDecodeTime"] as? Number)?.toDouble(); val df = (m["framesDecoded"] as? Number)?.toDouble()
++                if (dt != null && df != null) {
++                    if (lastDecoded >= 0 && df > lastDecoded) decodeMs = (dt - lastDecode) * 1000 / (df - lastDecoded)
++                    lastDecode = dt; lastDecoded = df
++                }
++            }
++            rtt?.let { rtts += it }; loss?.let { losses += it }; mbps?.let { rates += it }
++            val m = video?.members.orEmpty()
++            return Snapshot(now, engine, region, state, (m["frameWidth"] as? Number)?.toInt(), (m["frameHeight"] as? Number)?.toInt(),
++                (m["framesPerSecond"] as? Number)?.toDouble()?.roundToInt(), codecs[m["codecId"] as? String]?.takeIf { it.isNotEmpty() },
++                rtt, (m["jitter"] as? Number)?.toDouble()?.let { (it * 1000).roundToInt() }, loss, mbps, decodeMs,
++                (m["framesDropped"] as? Number)?.toLong(), capMbps)
++        }
++
++        /** The stream so far, averaged; null before WebRTC reported anything. */
++        fun summary(region: String?, capMbps: Int, now: Long = System.currentTimeMillis()): Summary? {
++            if (rtts.isEmpty() && losses.isEmpty() && rates.isEmpty()) return null
++            return Summary(now, engine, region, rtts.takeIf { it.isNotEmpty() }?.sorted()?.let { it[it.size / 2] },
++                losses.takeIf { it.isNotEmpty() }?.average(), rates.takeIf { it.isNotEmpty() }?.average(), capMbps)
++        }
++    }
++
++    /** The web player's report (see XboxCloudPlayerActivity.STATS_SHIM): [{type, id, timestamp, members}]. */
++    fun entries(json: String): List<Entry> {
++        val array = JSONArray(json)
++        return (0 until array.length()).mapNotNull { array.optJSONObject(it) }.map { o ->
++            val m = o.optJSONObject("members") ?: JSONObject()
++            val members = m.keys().asSequence().associateWith { k -> m.get(k).takeIf { it != JSONObject.NULL } }
++            Entry(o.optString("type"), o.optString("id"), o.optDouble("timestamp", 0.0), members)
++        }
++    }
++
++    @Volatile var live: Snapshot? = null
++        private set
++
++    fun update(context: Context, snapshot: Snapshot) {
++        live = snapshot
++        runCatching { prefs(context).edit().putString(LAST, snapshot.toJson().toString()).apply() }
++    }
++
++    fun ended(context: Context, summary: Summary?) {
++        live = live?.copy(state = "ended")?.also { last -> runCatching { prefs(context).edit().putString(LAST, last.toJson().toString()).apply() } }
++        summary ?: return
++        val history = history(context) + summary
++        runCatching {
++            prefs(context).edit().putString(HISTORY, JSONArray(history.takeLast(KEEP).map {
++                JSONObject().put("at", it.at).put("engine", it.engine).put("region", it.region ?: JSONObject.NULL)
++                    .put("rttMs", it.rttMs ?: JSONObject.NULL).put("lossPct", it.lossPct ?: JSONObject.NULL)
++                    .put("mbps", it.mbps ?: JSONObject.NULL).put("capMbps", it.capMbps)
++            }).toString()).apply()
++        }
++    }
++
++    fun last(context: Context): Snapshot? =
++        live ?: runCatching { prefs(context).getString(LAST, null)?.let { Snapshot.fromJson(JSONObject(it)) } }.getOrNull()
++
++    fun history(context: Context): List<Summary> = runCatching {
++        val array = JSONArray(prefs(context).getString(HISTORY, "[]"))
++        (0 until array.length()).map { array.getJSONObject(it) }.map {
++            Summary(it.optLong("at"), it.optString("engine"), it.optString("region").takeIf { r -> r.isNotEmpty() && !it.isNull("region") },
++                it.intOrNull("rttMs"), it.doubleOrNull("lossPct"), it.doubleOrNull("mbps"), it.optInt("capMbps"))
++        }
++    }.getOrDefault(emptyList())
++
++    /**
++     * The bitrate cap for the next stream when quality is automatic and no manual limit is set: after a stream that
++     * lost more than 2 % of its packets, 80 % of the rate it averaged (at least 5 Mb/s); after a clean stream under a
++     * cap, a quarter more, until the cap no longer matters (above 40 Mb/s: no cap). 0 = no cap.
++     */
++    fun autoCap(history: List<Summary>): Int {
++        val last = history.lastOrNull() ?: return 0
++        val loss = last.lossPct ?: return last.capMbps
++        return when {
++            loss > 2.0 && last.mbps != null -> (last.mbps * 0.8).roundToInt().coerceAtLeast(5).let { if (last.capMbps > 0) minOf(it, last.capMbps) else it }
++            loss < 0.5 && last.capMbps > 0 -> (last.capMbps * 1.25).roundToInt().let { if (it > 40) 0 else it }
++            else -> last.capMbps
++        }
++    }
++
++    /** Excellent / good / fair / poor, from what was measured; null when nothing was. */
++    fun quality(s: Snapshot): String? {
++        val rtt = s.rttMs; val loss = s.lossPct; val jitter = s.jitterMs
++        if (rtt == null && loss == null && jitter == null) return null
++        fun within(v: Number?, limit: Double) = v == null || v.toDouble() <= limit
++        return when {
++            within(rtt, 40.0) && within(loss, 0.5) && within(jitter, 10.0) -> "excellent"
++            within(rtt, 80.0) && within(loss, 1.5) && within(jitter, 20.0) -> "good"
++            within(rtt, 120.0) && within(loss, 3.0) && within(jitter, 40.0) -> "fair"
++            else -> "poor"
++        }
++    }
++
++    private fun prefs(context: Context) = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
++    private fun JSONObject.intOrNull(key: String) = if (!has(key) || isNull(key)) null else optInt(key)
++    private fun JSONObject.doubleOrNull(key: String) = if (!has(key) || isNull(key)) null else optDouble(key).takeIf { !it.isNaN() }
++}
+diff --git a/app/src/main/java/com/droiddeck/launcher/stores/xbox/XboxCloudStatsPanel.kt b/app/src/main/java/com/droiddeck/launcher/stores/xbox/XboxCloudStatsPanel.kt
+new file mode 100644
+index 0000000..7063c24
+--- /dev/null
++++ b/app/src/main/java/com/droiddeck/launcher/stores/xbox/XboxCloudStatsPanel.kt
+@@ -0,0 +1,131 @@
++package com.droiddeck.launcher.stores.xbox
++
++import android.content.Context
++import android.media.MediaCodecInfo
++import android.media.MediaCodecList
++import android.os.Build
++import androidx.compose.foundation.layout.Column
++import androidx.compose.foundation.layout.fillMaxWidth
++import androidx.compose.foundation.layout.padding
++import androidx.compose.foundation.shape.CircleShape
++import androidx.compose.material3.MaterialTheme
++import androidx.compose.material3.OutlinedButton
++import androidx.compose.material3.Text
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.LaunchedEffect
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableIntStateOf
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.remember
++import androidx.compose.runtime.rememberCoroutineScope
++import androidx.compose.runtime.setValue
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.platform.LocalContext
++import androidx.compose.ui.res.stringResource
++import androidx.compose.ui.unit.dp
++import com.droiddeck.launcher.R
++import com.droiddeck.launcher.stores.Store
++import com.droiddeck.launcher.stores.StoreAccounts
++import com.droiddeck.launcher.ui.focusGlide
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.delay
++import kotlinx.coroutines.launch
++import kotlinx.coroutines.withContext
++import java.text.DateFormat
++import java.util.Date
++
++/** The hardware H.264 decoder and whether it decodes 1080p at 60 fps, as Android reports them. */
++internal fun avcDecoder(): Pair<String, Boolean>? = runCatching {
++    MediaCodecList(MediaCodecList.REGULAR_CODECS).codecInfos
++        .filter { !it.isEncoder && it.supportedTypes.any { t -> t.equals("video/avc", true) } }
++        .sortedByDescending { hardware(it) }
++        .firstOrNull()
++        ?.let { info ->
++            val caps = info.getCapabilitiesForType("video/avc").videoCapabilities
++            info.name to (caps?.areSizeAndRateSupported(1920, 1080, 60.0) == true)
++        }
++}.getOrNull()
++
++private fun hardware(info: MediaCodecInfo): Boolean =
++    if (Build.VERSION.SDK_INT >= 29) info.isHardwareAccelerated
++    else !info.name.startsWith("OMX.google.") && !info.name.startsWith("c2.android.")
++
++@Composable
++internal fun CloudStatsSection() {
++    val context = LocalContext.current
++    var refresh by remember { mutableIntStateOf(0) }
++    var measuring by remember { mutableStateOf(false) }
++    val scope = rememberCoroutineScope()
++    LaunchedEffect(Unit) { while (true) { delay(2000); refresh++ } }
++    val stats = remember(refresh) { XboxCloudStats.last(context) }
++    val probes = remember(refresh) { XboxCloudNetwork.saved(context) }
++    val decoder = remember { avcDecoder() }
++    val dim = MaterialTheme.colorScheme.onSurfaceVariant
++    Column(Modifier.fillMaxWidth()) {
++        if (stats == null) {
++            Text(stringResource(R.string.xcloud_stats_none), style = MaterialTheme.typography.bodySmall, color = dim)
++        } else {
++            val unknown = stringResource(R.string.xcloud_stats_unknown)
++            fun <T> or(v: T?, f: (T) -> String) = v?.let(f) ?: unknown
++            val state = when (stats.state) {
++                "streaming" -> stringResource(R.string.xcloud_state_streaming); "connecting" -> stringResource(R.string.xcloud_state_connecting)
++                "reconnecting" -> stringResource(R.string.xcloud_state_reconnecting); "failed" -> stringResource(R.string.xcloud_state_failed)
++                else -> stringResource(R.string.xcloud_state_ended)
++            }
++            val quality = when (XboxCloudStats.quality(stats)) {
++                "excellent" -> stringResource(R.string.xcloud_quality_excellent); "good" -> stringResource(R.string.xcloud_quality_good)
++                "fair" -> stringResource(R.string.xcloud_quality_fair); "poor" -> stringResource(R.string.xcloud_quality_poor)
++                else -> unknown
++            }
++            val lines = listOf(
++                stringResource(R.string.xcloud_stats_state, state, DateFormat.getTimeInstance(DateFormat.SHORT).format(Date(stats.at)),
++                    if (stats.engine == "native") stringResource(R.string.xcloud_engine_native) else stringResource(R.string.xcloud_engine_web)),
++                stringResource(R.string.xcloud_stats_region, stats.region ?: unknown),
++                stringResource(R.string.xcloud_stats_video, if (stats.width != null && stats.height != null) "${stats.width}×${stats.height}" else unknown,
++                    or(stats.fps) { "$it" }, stats.codec ?: unknown),
++                stringResource(R.string.xcloud_stats_network, or(stats.rttMs) { "$it ms" }, or(stats.jitterMs) { "$it ms" },
++                    or(stats.lossPct) { String.format("%.1f %%", it) }),
++                stringResource(R.string.xcloud_stats_bitrate, or(stats.mbps) { String.format("%.1f Mb/s", it) },
++                    if (stats.capMbps > 0) "${stats.capMbps} Mb/s" else stringResource(R.string.xcloud_stats_no_cap),
++                    or(stats.decodeMs) { String.format("%.1f ms", it) }),
++                stringResource(R.string.xcloud_stats_quality, quality),
++            )
++            lines.forEach { Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurface) }
++        }
++        decoder?.let { (name, fullHd) ->
++            Text(stringResource(if (fullHd) R.string.xcloud_decoder_1080 else R.string.xcloud_decoder_no_1080, name),
++                style = MaterialTheme.typography.bodySmall, color = dim, modifier = Modifier.padding(top = 4.dp))
++        }
++        Text(stringResource(R.string.xcloud_regions_title), style = MaterialTheme.typography.bodyMedium, modifier = Modifier.padding(top = 8.dp))
++        if (probes == null) {
++            Text(stringResource(R.string.xcloud_regions_none), style = MaterialTheme.typography.bodySmall, color = dim)
++        } else {
++            val chosen = XboxCloudNetwork.choose(probes.second)?.region
++            probes.second.sortedBy { it.medianMs ?: Int.MAX_VALUE }.forEach { p ->
++                val ms = p.medianMs?.let { stringResource(R.string.xcloud_region_ms, it, p.spreadMs ?: 0) } ?: stringResource(R.string.xcloud_region_no_answer)
++                val marks = listOfNotNull(stringResource(R.string.xcloud_region_default).takeIf { p.isDefault },
++                    stringResource(R.string.xcloud_region_chosen).takeIf { p.region == chosen }).joinToString(" · ")
++                Text("${p.region}: $ms" + if (marks.isNotEmpty()) "  ($marks)" else "", style = MaterialTheme.typography.bodySmall)
++            }
++            Text(stringResource(R.string.xcloud_regions_rule, XboxCloudNetwork.MIN_GAIN_MS, (XboxCloudNetwork.MIN_GAIN_SHARE * 100).toInt()),
++                style = MaterialTheme.typography.bodySmall, color = dim)
++        }
++        OutlinedButton(enabled = !measuring, modifier = Modifier.padding(top = 6.dp).focusGlide(CircleShape), onClick = {
++            measuring = true
++            scope.launch {
++                withContext(Dispatchers.IO) { measure(context) }
++                measuring = false
++                refresh++
++            }
++        }) { Text(stringResource(if (measuring) R.string.xcloud_regions_measuring else R.string.xcloud_regions_measure)) }
++        Text(stringResource(R.string.xcloud_regions_note), style = MaterialTheme.typography.bodySmall, color = dim, modifier = Modifier.padding(top = 4.dp))
++    }
++}
++
++private fun measure(context: Context) {
++    runCatching {
++        val account = StoreAccounts.signedInAs(context.applicationContext, Store.XBOX) ?: return
++        val session = XboxCloudSession.get(context.applicationContext, account)
++        XboxCloudNetwork.save(context, XboxCloudNetwork.probe(session.regionList))
++    }
++}
+diff --git a/app/src/main/java/com/droiddeck/launcher/stores/xbox/XboxNativePlayerActivity.kt b/app/src/main/java/com/droiddeck/launcher/stores/xbox/XboxNativePlayerActivity.kt
+index 2125bf8..bc4a095 100644
+--- a/app/src/main/java/com/droiddeck/launcher/stores/xbox/XboxNativePlayerActivity.kt
++++ b/app/src/main/java/com/droiddeck/launcher/stores/xbox/XboxNativePlayerActivity.kt
+@@ -78,6 +78,10 @@ class XboxNativePlayerActivity : ComponentActivity() {
+     private var notice: androidx.compose.ui.platform.ComposeView? = null
+     @Volatile private var regionNames = emptyList<String>()
+     @Volatile private var serverName: String? = null
++    private val statsReader = XboxCloudStats.Reader("native")
++    @Volatile private var streamState = "connecting"
++    @Volatile private var autoCap = 0
++    @Volatile private var statsEnded = false
+     private val candidates = mutableListOf<IceCandidate>()
+     private val gathered = CountDownLatch(1)
+     private var menu: androidx.compose.ui.platform.ComposeView? = null
+@@ -208,6 +212,7 @@ class XboxNativePlayerActivity : ComponentActivity() {
+ 
+     private fun endInBackground() {
+         if (closed || endedInBackground) return
++        endStats()
+         endedInBackground = true
+         closed = true
+         log("ending the session: ${BACKGROUND_GRACE_MS / 1000} s in the background")
+@@ -229,7 +234,12 @@ class XboxNativePlayerActivity : ComponentActivity() {
+         val shared = runCatching { XboxCloudSession.fromMainProcess(applicationContext, account) }
+             .onFailure { log("tokens from the main process: ${it.message?.take(160)}") }.getOrNull()
+         log(if (shared != null) "tokens from the main process" else "tokens fetched here")
+-        val active = (shared ?: XboxCloudSession.get(applicationContext, account)).forStream(settings.region, settings.osName)
++        val base = shared ?: XboxCloudSession.get(applicationContext, account)
++        val regionName = if (settings.region == XboxCloudSettings.REGION_LOWEST_LATENCY)
++            XboxCloudNetwork.bestRegion(applicationContext, base.regionList) { log(it) }.orEmpty() else settings.region
++        val active = base.forStream(regionName, settings.osName)
++        autoCap = if (settings.autoQuality && settings.bitrateMbps == 0) XboxCloudStats.autoCap(XboxCloudStats.history(applicationContext)) else 0
++        if (autoCap > 0) log("automatic quality: the last stream lost packets or was capped; bitrate limit $autoCap Mb/s")
+         regionNames = active.regionList.map { it.name }
+         serverName = active.regionList.firstOrNull { it.baseUri == active.baseUri }?.name
+         val title = XboxCloudSession.titles(active)[product] ?: error("This game can't be streamed with this account here.")
+@@ -301,6 +311,7 @@ class XboxNativePlayerActivity : ComponentActivity() {
+         log("signalling done: ${local2.size} local / ${remote.length()} remote candidates")
+         ticker.scheduleWithFixedDelay({ runCatching { signals.op("keepalive") } }, 30, 30, TimeUnit.SECONDS)
+         ticker.scheduleWithFixedDelay({ runCatching { updateOverlay() } }, 1, 1, TimeUnit.SECONDS)
++        ticker.scheduleWithFixedDelay({ runCatching { collectStats() } }, 2, 2, TimeUnit.SECONDS)
+     }
+ 
+     private fun expect(stage: String, reply: XboxCloudSession.Reply): XboxCloudSession.Reply {
+@@ -318,13 +329,14 @@ class XboxNativePlayerActivity : ComponentActivity() {
+                 (parts.take(3) + ids + parts.drop(3).filter { it !in ids }).joinToString(" ")
+             }
+         }
+-        if (settings.bitrateMbps > 0) {
++        val cap = if (settings.bitrateMbps > 0) settings.bitrateMbps else autoCap
++        if (cap > 0) {
+             val lines = out.split("\r\n").toMutableList()
+             val start = lines.indexOfFirst { it.startsWith("m=video") }
+             if (start >= 0) {
+                 var i = start + 1
+                 while (i < lines.size && (lines[i].startsWith("i=") || lines[i].startsWith("c="))) i++
+-                if (i < lines.size && lines[i].startsWith("b=AS:")) lines[i] = "b=AS:${settings.bitrateMbps * 1000}" else lines.add(i, "b=AS:${settings.bitrateMbps * 1000}")
++                if (i < lines.size && lines[i].startsWith("b=AS:")) lines[i] = "b=AS:${cap * 1000}" else lines.add(i, "b=AS:${cap * 1000}")
+                 out = lines.joinToString("\r\n")
+             }
+         }
+@@ -364,13 +376,14 @@ class XboxNativePlayerActivity : ComponentActivity() {
+             log("connection $state")
+             when (state) {
+                 PeerConnection.PeerConnectionState.CONNECTED -> {
++                    streamState = "streaming"
+                     connectedOnce = true
+                     show("")
+                     video?.setFpsTarget(settings.fpsTarget)
+                     video?.setFrameGeneration(effectiveFrameGen())
+                 }
+-                PeerConnection.PeerConnectionState.FAILED -> fail("webrtc", "connection failed")
+-                PeerConnection.PeerConnectionState.DISCONNECTED -> show("Connection lost…")
++                PeerConnection.PeerConnectionState.FAILED -> { streamState = "failed"; fail("webrtc", "connection failed") }
++                PeerConnection.PeerConnectionState.DISCONNECTED -> { streamState = "reconnecting"; show("Connection lost…") }
+                 else -> {}
+             }
+         }
+@@ -752,7 +765,23 @@ class XboxNativePlayerActivity : ComponentActivity() {
+ 
+     override fun onWindowFocusChanged(hasFocus: Boolean) { super.onWindowFocusChanged(hasFocus); if (hasFocus) hideBars() }
+ 
++    private fun collectStats() {
++        val peer = pc ?: return
++        peer.getStats { report ->
++            val entries = report.statsMap.values.map { XboxCloudStats.Entry(it.type, it.id, it.timestampUs / 1000.0, it.members) }
++            val cap = if (settings.bitrateMbps > 0) settings.bitrateMbps else autoCap
++            if (!statsEnded) XboxCloudStats.update(applicationContext, statsReader.read(entries, serverName, streamState, cap))
++        }
++    }
++
++    private fun endStats() {
++        if (statsEnded) return
++        statsEnded = true
++        XboxCloudStats.ended(applicationContext, statsReader.summary(serverName, if (settings.bitrateMbps > 0) settings.bitrateMbps else autoCap))
++    }
++
+     override fun onDestroy() {
++        endStats()
+         closed = true
+         ticker.shutdownNow()
+         val signals = signalling
+diff --git a/app/src/main/java/com/droiddeck/launcher/ui/SessionLoading.kt b/app/src/main/java/com/droiddeck/launcher/ui/SessionLoading.kt
+index 85a1462..0c5940f 100644
+--- a/app/src/main/java/com/droiddeck/launcher/ui/SessionLoading.kt
++++ b/app/src/main/java/com/droiddeck/launcher/ui/SessionLoading.kt
+@@ -152,6 +152,7 @@ fun LoadingOverlay(
+     onRepair: (() -> Unit)? = null,
+     onShareLogs: (() -> Unit)? = null,
+     onClose: (() -> Unit)? = null,
++    longWait: Boolean = false,
+     flood: Color? = null,
+     onFlooded: () -> Unit = {},
+ ) {
+@@ -223,6 +224,8 @@ fun LoadingOverlay(
+             modifier = Modifier.align(Alignment.BottomCenter).padding(start = 120.dp, end = 120.dp, bottom = 28.dp),
+         )
+         if (!ended && onCancel != null) CancelHint(onCancel, Modifier.align(Alignment.BottomEnd).padding(end = 16.dp, bottom = 16.dp))
++        // A start that takes long can be shared while it still runs, not only after it ended.
++        if (!ended && longWait && onShareLogs != null) ShareHint(onShareLogs, Modifier.align(Alignment.BottomStart).padding(start = 16.dp, bottom = 16.dp))
+         if (flood != null) FloodGather(flood, ball, onFlooded)
+     }
+ }
+@@ -275,6 +278,26 @@ private fun LoadSegments(count: Int, active: Int, percent: Int, modifier: Modifi
+     }
+ }
+ 
++@Composable
++private fun ShareHint(onShare: () -> Unit, modifier: Modifier = Modifier) {
++    val colors = MaterialTheme.colorScheme
++    val src = remember { MutableInteractionSource() }
++    val hot = src.collectIsHoveredAsState().value || src.collectIsFocusedAsState().value
++    val progress = com.droiddeck.launcher.session.SessionLogShare.progress
++    Row(
++        verticalAlignment = Alignment.CenterVertically,
++        modifier = modifier.heightIn(min = 44.dp).clip(RoundedCornerShape(22.dp))
++            .background(if (hot) colors.onBackground.copy(alpha = 0.08f) else Color.Transparent)
++            .glideBorder(hot, RoundedCornerShape(22.dp), LocalPalette.current.signal)
++            .hoverable(src).clickable(interactionSource = src, indication = LocalIndication.current, role = Role.Button,
++                enabled = progress == null, onClick = onShare)
++            .padding(horizontal = 12.dp),
++    ) {
++        Text(stringResource(R.string.drawer_share_logs) + (progress?.let { " · ${(it * 100).toInt()}%" } ?: ""), fontSize = 13.sp,
++            color = colors.onSurfaceVariant)
++    }
++}
++
+ @Composable
+ private fun CancelHint(onCancel: () -> Unit, modifier: Modifier = Modifier) {
+     val colors = MaterialTheme.colorScheme
+diff --git a/app/src/main/res/values-b+es+419/strings.xml b/app/src/main/res/values-b+es+419/strings.xml
+index 7284045..6de2db7 100644
+--- a/app/src/main/res/values-b+es+419/strings.xml
++++ b/app/src/main/res/values-b+es+419/strings.xml
+@@ -2254,7 +2254,7 @@
+     <string name="profile_custom_hint">Se cambiaron ajustes a mano. Elige un perfil para volver a fijarlos juntos; no se toca nada más.</string>
+     <string name="profile_balanced">Equilibrado</string>
+     <string name="profile_balanced_hint">Los valores de DroidDeck para este dispositivo: 60 Hz con una GPU de gama baja, el preset estándar de FEX, todos los núcleos compartidos y el stream de Xbox Cloud por defecto.</string>
+-    <string name="profile_performance">Rendimiento</string>
++    <string name="profile_performance">Máximo rendimiento seguro</string>
+     <string name="profile_performance_hint">El juego se queda con los núcleos rápidos: el cliente de Steam pasa a los núcleos de eficiencia, se pide a Android que mantenga alimentados los hilos más ocupados del juego (se detiene con calor severo), sin compilar shaders en segundo plano con una GPU de gama baja y Xbox Cloud con la menor latencia.</string>
+     <string name="profile_battery">Ahorro</string>
+     <string name="profile_battery_hint">Sesión a 30 Hz (la mitad de fotogramas), cliente y compositor en los núcleos de eficiencia, sin compilar shaders ni descargar en segundo plano, Xbox Cloud a 720p y 8 Mb/s con la pantalla a 60 Hz.</string>
+@@ -3705,4 +3705,43 @@
+     <string name="input_layout_import_failed">No se pudo importar esta disposición</string>
+     <string name="theme_white_red">Nieve escarlata</string>
+     <string name="theme_white_red_detail">Superficies blancas con acentos rojos.</string>
++    <string name="xcloud_stats_title">Estadísticas</string>
++    <string name="xcloud_stats_note">Medidas por WebRTC durante la última transmisión (ambos reproductores). Lo que WebRTC no informa aparece como desconocido.</string>
++    <string name="xcloud_stats_none">Todavía no se ha medido ninguna transmisión.</string>
++    <string name="xcloud_stats_unknown">desconocido</string>
++    <string name="xcloud_state_streaming">transmitiendo</string>
++    <string name="xcloud_state_connecting">conectando</string>
++    <string name="xcloud_state_reconnecting">reconectando</string>
++    <string name="xcloud_state_failed">fallida</string>
++    <string name="xcloud_state_ended">terminada</string>
++    <string name="xcloud_quality_excellent">excelente</string>
++    <string name="xcloud_quality_good">buena</string>
++    <string name="xcloud_quality_fair">regular</string>
++    <string name="xcloud_quality_poor">mala</string>
++    <string name="xcloud_engine_native">reproductor nativo</string>
++    <string name="xcloud_engine_web">reproductor web</string>
++    <string name="xcloud_stats_state">Transmisión: %1$s (%2$s, %3$s)</string>
++    <string name="xcloud_stats_region">Región: %1$s</string>
++    <string name="xcloud_stats_video">Vídeo: %1$s · %2$s fps recibidos · códec %3$s</string>
++    <string name="xcloud_stats_network">Latencia (ida y vuelta) %1$s · jitter %2$s · pérdida de paquetes %3$s</string>
++    <string name="xcloud_stats_bitrate">Bitrate %1$s · límite %2$s · decodificación %3$s por fotograma</string>
++    <string name="xcloud_stats_no_cap">ninguno</string>
++    <string name="xcloud_stats_quality">Calidad de la conexión: %1$s</string>
++    <string name="xcloud_decoder_1080">Decodificador H.264: %1$s, admite 1080p a 60 fps</string>
++    <string name="xcloud_decoder_no_1080">Decodificador H.264: %1$s, NO admite 1080p a 60 fps: usa 720p</string>
++    <string name="xcloud_regions_title">Latencia a las regiones que Microsoft ofrece a esta cuenta</string>
++    <string name="xcloud_regions_none">Todavía sin medir.</string>
++    <string name="xcloud_region_ms">%1$d ms (variación %2$d ms)</string>
++    <string name="xcloud_region_no_answer">sin respuesta</string>
++    <string name="xcloud_region_default">la de Microsoft por defecto</string>
++    <string name="xcloud_region_chosen">usada con menor latencia</string>
++    <string name="xcloud_regions_rule">Solo se usa una región distinta de la de Microsoft si responde al menos %1$d ms y un %2$d %% más rápido.</string>
++    <string name="xcloud_regions_measure">Medir la latencia ahora</string>
++    <string name="xcloud_regions_measuring">Midiendo…</string>
++    <string name="xcloud_regions_note">Solo se miden y usan regiones oficiales: sin VPN y sin tocar el inicio de sesión. Si Xbox Cloud Gaming no se ofrece en tu país, Microsoft no devuelve transmisión y DroidDeck lo indica.</string>
++    <string name="xcloud_region_label">Región del servidor</string>
++    <string name="xcloud_region_microsoft">La que elija Microsoft</string>
++    <string name="xcloud_region_lowest">Menor latencia medida</string>
++    <string name="xcloud_auto_quality">Calidad automática</string>
++    <string name="xcloud_auto_quality_hint" formatted="false">Sin límite de bitrate fijado: tras una transmisión que perdió más del 2 % de los paquetes, la siguiente se limita al 80 % del bitrate que alcanzó; tras transmisiones limpias el límite vuelve a subir.</string>
+ </resources>
+diff --git a/app/src/main/res/values-es/strings.xml b/app/src/main/res/values-es/strings.xml
+index 585d439..736b875 100644
+--- a/app/src/main/res/values-es/strings.xml
++++ b/app/src/main/res/values-es/strings.xml
+@@ -2209,7 +2209,7 @@
+     <string name="profile_custom_hint">Se cambiaron ajustes a mano. Elige un perfil para volver a fijarlos juntos; no se toca nada más.</string>
+     <string name="profile_balanced">Equilibrado</string>
+     <string name="profile_balanced_hint">Los valores de DroidDeck para este dispositivo: 60 Hz con una GPU de gama baja, el preset estándar de FEX, todos los núcleos compartidos y el stream de Xbox Cloud por defecto.</string>
+-    <string name="profile_performance">Rendimiento</string>
++    <string name="profile_performance">Máximo rendimiento seguro</string>
+     <string name="profile_performance_hint">El juego se queda con los núcleos rápidos: el cliente de Steam pasa a los núcleos de eficiencia, se pide a Android que mantenga alimentados los hilos más ocupados del juego (se detiene con calor severo), sin compilar shaders en segundo plano con una GPU de gama baja y Xbox Cloud con la menor latencia.</string>
+     <string name="profile_battery">Ahorro</string>
+     <string name="profile_battery_hint">Sesión a 30 Hz (la mitad de fotogramas), cliente y compositor en los núcleos de eficiencia, sin compilar shaders ni descargar en segundo plano, Xbox Cloud a 720p y 8 Mb/s con la pantalla a 60 Hz.</string>
+@@ -3733,4 +3733,43 @@
+ 
+     <string name="theme_white_red">Nieve escarlata</string>
+     
++    <string name="xcloud_stats_title">Estadísticas</string>
++    <string name="xcloud_stats_note">Medidas por WebRTC durante la última transmisión (ambos reproductores). Lo que WebRTC no informa aparece como desconocido.</string>
++    <string name="xcloud_stats_none">Todavía no se ha medido ninguna transmisión.</string>
++    <string name="xcloud_stats_unknown">desconocido</string>
++    <string name="xcloud_state_streaming">transmitiendo</string>
++    <string name="xcloud_state_connecting">conectando</string>
++    <string name="xcloud_state_reconnecting">reconectando</string>
++    <string name="xcloud_state_failed">fallida</string>
++    <string name="xcloud_state_ended">terminada</string>
++    <string name="xcloud_quality_excellent">excelente</string>
++    <string name="xcloud_quality_good">buena</string>
++    <string name="xcloud_quality_fair">regular</string>
++    <string name="xcloud_quality_poor">mala</string>
++    <string name="xcloud_engine_native">reproductor nativo</string>
++    <string name="xcloud_engine_web">reproductor web</string>
++    <string name="xcloud_stats_state">Transmisión: %1$s (%2$s, %3$s)</string>
++    <string name="xcloud_stats_region">Región: %1$s</string>
++    <string name="xcloud_stats_video">Vídeo: %1$s · %2$s fps recibidos · códec %3$s</string>
++    <string name="xcloud_stats_network">Latencia (ida y vuelta) %1$s · jitter %2$s · pérdida de paquetes %3$s</string>
++    <string name="xcloud_stats_bitrate">Bitrate %1$s · límite %2$s · decodificación %3$s por fotograma</string>
++    <string name="xcloud_stats_no_cap">ninguno</string>
++    <string name="xcloud_stats_quality">Calidad de la conexión: %1$s</string>
++    <string name="xcloud_decoder_1080">Decodificador H.264: %1$s, admite 1080p a 60 fps</string>
++    <string name="xcloud_decoder_no_1080">Decodificador H.264: %1$s, NO admite 1080p a 60 fps: usa 720p</string>
++    <string name="xcloud_regions_title">Latencia a las regiones que Microsoft ofrece a esta cuenta</string>
++    <string name="xcloud_regions_none">Todavía sin medir.</string>
++    <string name="xcloud_region_ms">%1$d ms (variación %2$d ms)</string>
++    <string name="xcloud_region_no_answer">sin respuesta</string>
++    <string name="xcloud_region_default">la de Microsoft por defecto</string>
++    <string name="xcloud_region_chosen">usada con menor latencia</string>
++    <string name="xcloud_regions_rule">Solo se usa una región distinta de la de Microsoft si responde al menos %1$d ms y un %2$d %% más rápido.</string>
++    <string name="xcloud_regions_measure">Medir la latencia ahora</string>
++    <string name="xcloud_regions_measuring">Midiendo…</string>
++    <string name="xcloud_regions_note">Solo se miden y usan regiones oficiales: sin VPN y sin tocar el inicio de sesión. Si Xbox Cloud Gaming no se ofrece en tu país, Microsoft no devuelve transmisión y DroidDeck lo indica.</string>
++    <string name="xcloud_region_label">Región del servidor</string>
++    <string name="xcloud_region_microsoft">La que elija Microsoft</string>
++    <string name="xcloud_region_lowest">Menor latencia medida</string>
++    <string name="xcloud_auto_quality">Calidad automática</string>
++    <string name="xcloud_auto_quality_hint" formatted="false">Sin límite de bitrate fijado: tras una transmisión que perdió más del 2 % de los paquetes, la siguiente se limita al 80 % del bitrate que alcanzó; tras transmisiones limpias el límite vuelve a subir.</string>
+ </resources>
+diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
+index 9a990a4..1c40d20 100644
+--- a/app/src/main/res/values/strings.xml
++++ b/app/src/main/res/values/strings.xml
+@@ -2410,7 +2410,7 @@
+     <string name="profile_custom_hint">Settings were changed by hand. Pick a profile to set them together again; nothing else is touched.</string>
+     <string name="profile_balanced">Balanced</string>
+     <string name="profile_balanced_hint">DroidDeck\'s defaults for this device: 60 Hz on a low-tier GPU, the standard FEX preset, every core shared, the default Xbox Cloud stream.</string>
+-    <string name="profile_performance">Performance</string>
++    <string name="profile_performance">Maximum safe performance</string>
+     <string name="profile_performance_hint">The game gets the fast cores: the Steam client moves to the efficiency cores, Android is asked to keep the busiest game threads fed (stops at severe heat), no background shader compiling on a low-tier GPU, lowest-latency Xbox Cloud path.</string>
+     <string name="profile_battery">Battery saver</string>
+     <string name="profile_battery_hint">30 Hz session (half the frames), client and compositor on the efficiency cores, no background shader compiling or downloads, Xbox Cloud at 720p and 8 Mb/s with the screen at 60 Hz.</string>
+@@ -3855,4 +3855,43 @@
+ 
+     <string name="theme_white_red">Scarlet Snow</string>
+     <string name="theme_white_red_detail">White surfaces with red accents.</string>
++    <string name="xcloud_stats_title">Statistics</string>
++    <string name="xcloud_stats_note">Measured by WebRTC during the last stream (both players). Values WebRTC does not report show as unknown.</string>
++    <string name="xcloud_stats_none">No stream measured yet.</string>
++    <string name="xcloud_stats_unknown">unknown</string>
++    <string name="xcloud_state_streaming">streaming</string>
++    <string name="xcloud_state_connecting">connecting</string>
++    <string name="xcloud_state_reconnecting">reconnecting</string>
++    <string name="xcloud_state_failed">failed</string>
++    <string name="xcloud_state_ended">ended</string>
++    <string name="xcloud_quality_excellent">excellent</string>
++    <string name="xcloud_quality_good">good</string>
++    <string name="xcloud_quality_fair">fair</string>
++    <string name="xcloud_quality_poor">poor</string>
++    <string name="xcloud_engine_native">native player</string>
++    <string name="xcloud_engine_web">web player</string>
++    <string name="xcloud_stats_state">Stream: %1$s (%2$s, %3$s)</string>
++    <string name="xcloud_stats_region">Region: %1$s</string>
++    <string name="xcloud_stats_video">Video: %1$s · %2$s fps received · codec %3$s</string>
++    <string name="xcloud_stats_network">Round trip %1$s · jitter %2$s · packet loss %3$s</string>
++    <string name="xcloud_stats_bitrate">Bitrate %1$s · limit %2$s · decode %3$s per frame</string>
++    <string name="xcloud_stats_no_cap">none</string>
++    <string name="xcloud_stats_quality">Connection quality: %1$s</string>
++    <string name="xcloud_decoder_1080">H.264 decoder: %1$s, 1080p at 60 fps supported</string>
++    <string name="xcloud_decoder_no_1080">H.264 decoder: %1$s, 1080p at 60 fps NOT supported: use 720p</string>
++    <string name="xcloud_regions_title">Latency to the regions Microsoft offers this account</string>
++    <string name="xcloud_regions_none">Not measured yet.</string>
++    <string name="xcloud_region_ms">%1$d ms (spread %2$d ms)</string>
++    <string name="xcloud_region_no_answer">no answer</string>
++    <string name="xcloud_region_default">Microsoft\'s default</string>
++    <string name="xcloud_region_chosen">used with lowest latency</string>
++    <string name="xcloud_regions_rule">Another region than Microsoft\'s default is only used when it answers at least %1$d ms and %2$d%% faster.</string>
++    <string name="xcloud_regions_measure">Measure latency now</string>
++    <string name="xcloud_regions_measuring">Measuring…</string>
++    <string name="xcloud_regions_note">Only official regions are measured and used: no VPN and no change to the sign-in. If Xbox Cloud Gaming is not offered in your country, Microsoft returns no stream and DroidDeck says so.</string>
++    <string name="xcloud_region_label">Server region</string>
++    <string name="xcloud_region_microsoft">Microsoft\'s choice</string>
++    <string name="xcloud_region_lowest">Lowest measured latency</string>
++    <string name="xcloud_auto_quality">Automatic quality</string>
++    <string name="xcloud_auto_quality_hint" formatted="false">With no bitrate limit set: after a stream that lost over 2% of its packets, the next one is limited to 80% of the rate it reached; after clean streams the limit rises again.</string>
+ </resources>
+diff --git a/app/src/test/java/com/droiddeck/launcher/session/DiagnosticsExtrasTest.kt b/app/src/test/java/com/droiddeck/launcher/session/DiagnosticsExtrasTest.kt
+new file mode 100644
+index 0000000..ae9610e
+--- /dev/null
++++ b/app/src/test/java/com/droiddeck/launcher/session/DiagnosticsExtrasTest.kt
+@@ -0,0 +1,39 @@
++package com.droiddeck.launcher.session
++
++import android.app.Application
++import org.junit.Assert.assertTrue
++import org.junit.Rule
++import org.junit.Test
++import org.junit.rules.TemporaryFolder
++import org.robolectric.RuntimeEnvironment
++import java.io.File
++import java.util.Calendar
++import java.util.TimeZone
++
++@org.junit.runner.RunWith(org.robolectric.RobolectricTestRunner::class)
++@org.robolectric.annotation.Config(sdk = [33], application = Application::class)
++class DiagnosticsExtrasTest {
++    @get:Rule val tmp = TemporaryFolder()
++
++    private fun utc(h: Int, m: Int, s: Int) = Calendar.getInstance(TimeZone.getTimeZone("UTC")).apply {
++        set(2026, Calendar.NOVEMBER, 21, h, m, s); set(Calendar.MILLISECOND, 0)
++    }.timeInMillis
++
++    @Test fun aStartThatNeverReachedTheScreenSaysWhereItIs() {
++        val dir = tmp.newFolder("session")
++        File(dir, "events.jsonl").writeText("""{"t":${utc(10, 0, 0)},"event":"session.created"}""" + "\n")
++        File(dir, "session.log").writeText("== STEP 10:00:04.000 starting the session\n== STEP 10:00:30.000 starting the Steam client\n" +
++            "== STEP 10:05:30 steam is still starting: 300 s, client cpu 0%\n")
++        val report = DiagnosticsExtras.sessionReport(dir, now = utc(10, 10, 30))
++        assertTrue(report, "linux_ms=4000" in report)
++        assertTrue(report, "Steam started 600 s ago and has not reached the screen" in report)
++        assertTrue(report, "last step: steam is still starting" in report)
++    }
++
++    @Test fun theShareFolderGetsTimingsAndMemory() {
++        val dir = tmp.newFolder("shared")
++        DiagnosticsExtras.write(RuntimeEnvironment.getApplication(), dir)
++        assertTrue(File(dir, "timings.txt").readText().contains("start-up times"))
++        assertTrue(File(dir, "memory.txt").isFile)
++    }
++}
+diff --git a/app/src/test/java/com/droiddeck/launcher/stores/xbox/XboxCloudStatsTest.kt b/app/src/test/java/com/droiddeck/launcher/stores/xbox/XboxCloudStatsTest.kt
+new file mode 100644
+index 0000000..61bfc61
+--- /dev/null
++++ b/app/src/test/java/com/droiddeck/launcher/stores/xbox/XboxCloudStatsTest.kt
+@@ -0,0 +1,98 @@
++package com.droiddeck.launcher.stores.xbox
++
++import android.app.Application
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertNull
++import org.junit.Assert.assertTrue
++import org.junit.Test
++import org.robolectric.RuntimeEnvironment
++
++@org.junit.runner.RunWith(org.robolectric.RobolectricTestRunner::class)
++@org.robolectric.annotation.Config(sdk = [33], application = Application::class)
++class XboxCloudStatsTest {
++    private fun report(atMs: Double, bytes: Long, lost: Int, received: Int, decodeS: Double, decoded: Int) = listOf(
++        XboxCloudStats.Entry("codec", "C1", atMs, mapOf("mimeType" to "video/H264")),
++        XboxCloudStats.Entry("candidate-pair", "P1", atMs, mapOf("state" to "succeeded", "nominated" to true, "currentRoundTripTime" to 0.052)),
++        XboxCloudStats.Entry("inbound-rtp", "V1", atMs, mapOf("kind" to "video", "frameWidth" to 1920, "frameHeight" to 1080,
++            "framesPerSecond" to 59.8, "codecId" to "C1", "bytesReceived" to bytes, "packetsLost" to lost, "packetsReceived" to received,
++            "jitter" to 0.004, "totalDecodeTime" to decodeS, "framesDecoded" to decoded, "framesDropped" to 3L)),
++    )
++
++    @Test fun ratesComeFromTheChangeBetweenReports() {
++        val reader = XboxCloudStats.Reader("native")
++        val first = reader.read(report(1000.0, 1_000_000, 0, 1000, 1.0, 100), "EastUS", "streaming", 0)
++        assertNull(first.mbps)
++        assertEquals(1920, first.width); assertEquals(60, first.fps); assertEquals("H264", first.codec)
++        assertEquals(52, first.rttMs); assertEquals(4, first.jitterMs)
++        val second = reader.read(report(3000.0, 6_000_000, 10, 1990, 1.6, 220), "EastUS", "streaming", 0)
++        assertEquals(20.0, second.mbps!!, 0.01)          // 5 MB in 2 s
++        assertEquals(1.0, second.lossPct!!, 0.01)         // 10 lost of 1000 more
++        assertEquals(5.0, second.decodeMs!!, 0.01)        // 0.6 s for 120 frames
++        val summary = reader.summary("EastUS", 0)!!
++        assertEquals(52, summary.rttMs); assertEquals(1.0, summary.lossPct!!, 0.01); assertEquals(20.0, summary.mbps!!, 0.01)
++    }
++
++    @Test fun nothingReportedStaysUnknown() {
++        val s = XboxCloudStats.Reader("web").read(emptyList(), null, "connecting", 0)
++        assertNull(s.width); assertNull(s.rttMs); assertNull(s.codec)
++        assertNull(XboxCloudStats.quality(s))
++    }
++
++    @Test fun automaticQualityLowersAfterLossAndRisesAfterCleanStreams() {
++        fun summary(loss: Double?, mbps: Double?, cap: Int) = XboxCloudStats.Summary(0, "native", "EastUS", 60, loss, mbps, cap)
++        assertEquals(0, XboxCloudStats.autoCap(emptyList()))
++        assertEquals(16, XboxCloudStats.autoCap(listOf(summary(3.5, 20.0, 0))))
++        assertEquals(5, XboxCloudStats.autoCap(listOf(summary(9.0, 4.0, 0))))
++        assertEquals(12, XboxCloudStats.autoCap(listOf(summary(3.0, 20.0, 12))))   // never above the cap that still lost packets
++        assertEquals(20, XboxCloudStats.autoCap(listOf(summary(0.2, 15.0, 16))))
++        assertEquals(0, XboxCloudStats.autoCap(listOf(summary(0.1, 30.0, 35))))     // past 40 Mb/s the cap goes away
++        assertEquals(16, XboxCloudStats.autoCap(listOf(summary(1.0, 15.0, 16))))   // in between: kept
++        assertEquals(16, XboxCloudStats.autoCap(listOf(summary(null, null, 16))))
++    }
++
++    @Test fun connectionQualityFollowsTheMeasuredValues() {
++        fun q(rtt: Int?, loss: Double?, jitter: Int?) = XboxCloudStats.quality(XboxCloudStats.Snapshot(0, "native", null, "streaming",
++            rttMs = rtt, lossPct = loss, jitterMs = jitter))
++        assertEquals("excellent", q(30, 0.1, 5)); assertEquals("good", q(70, 1.0, 15))
++        assertEquals("fair", q(110, 2.5, 30)); assertEquals("poor", q(180, 5.0, 60))
++    }
++
++    @Test fun theWebPlayersReportIsRead() {
++        val json = """[{"type":"inbound-rtp","id":"V1","timestamp":5000.5,"members":{"kind":"video","frameWidth":1280,"frameHeight":720,"framesPerSecond":60}},
++            {"type":"candidate-pair","id":"P","timestamp":5000.5,"members":{"state":"succeeded","nominated":true,"currentRoundTripTime":0.08}}]"""
++        val s = XboxCloudStats.Reader("web").read(XboxCloudStats.entries(json), "SouthCentralUS", "streaming", 8)
++        assertEquals(1280, s.width); assertEquals(80, s.rttMs); assertEquals(8, s.capMbps)
++    }
++
++    @Test fun theLastStreamAndItsHistoryAreKept() {
++        val app = RuntimeEnvironment.getApplication()
++        val reader = XboxCloudStats.Reader("native")
++        reader.read(report(1000.0, 1_000_000, 0, 1000, 1.0, 100), "EastUS", "streaming", 0)
++        XboxCloudStats.update(app, reader.read(report(3000.0, 6_000_000, 10, 1990, 1.6, 220), "EastUS", "streaming", 0))
++        XboxCloudStats.ended(app, reader.summary("EastUS", 0))
++        assertEquals("ended", XboxCloudStats.last(app)!!.state)
++        assertEquals("EastUS", XboxCloudStats.history(app).last().region)
++    }
++}
++
++class XboxCloudNetworkTest {
++    private fun p(name: String, ms: Int?, default: Boolean = false, failures: Int = 0) = XboxCloudNetwork.Probe(name, default, ms, 3, failures)
++
++    @Test fun microsoftsDefaultIsKeptWithoutAClearGain() {
++        assertEquals("EastUS", XboxCloudNetwork.choose(listOf(p("EastUS", 80, true), p("SouthCentralUS", 70)))?.region)   // 10 ms: not enough
++        assertEquals("SouthCentralUS", XboxCloudNetwork.choose(listOf(p("EastUS", 100, true), p("SouthCentralUS", 70)))?.region)
++        assertEquals("EastUS", XboxCloudNetwork.choose(listOf(p("EastUS", 300, true), p("WestUS", 284)))?.region)          // 16 ms is 5 %
++    }
++
++    @Test fun unreachableRegionsAreNotChosen() {
++        assertEquals("EastUS", XboxCloudNetwork.choose(listOf(p("EastUS", 90, true), p("BrazilSouth", 20, failures = 3)))?.region)
++        assertEquals("WestUS", XboxCloudNetwork.choose(listOf(p("EastUS", null, true, failures = 5), p("WestUS", 120)))?.region)
++        assertNull(XboxCloudNetwork.choose(emptyList()))
++    }
++
++    @Test fun samplesBecomeAMedianAndASpread() {
++        val probe = XboxCloudNetwork.summarize("EastUS", true, listOf(71.2, 64.9, 90.0, 66.0, 65.5), 0)
++        assertEquals(66, probe.medianMs); assertEquals(25, probe.spreadMs)
++        assertNull(XboxCloudNetwork.summarize("X", false, emptyList(), 5).medianMs)
++    }
++}
+diff --git a/tools/linuxfs/overlay/usr/local/bin/droiddeck-proton-armv80 b/tools/linuxfs/overlay/usr/local/bin/droiddeck-proton-armv80
+index 664d40f..b7fba77 100755
+--- a/tools/linuxfs/overlay/usr/local/bin/droiddeck-proton-armv80
++++ b/tools/linuxfs/overlay/usr/local/bin/droiddeck-proton-armv80
+@@ -15,6 +15,7 @@ import shutil
+ import struct
+ import subprocess
+ import sys
++import time
+ import zlib
+ 
+ RELEASE = "DroidDeck-Proton 11-12.8"
+@@ -34,6 +35,31 @@ def log(message):
+     print("droiddeck-proton-armv80: " + message, flush=True)
+ 
+ 
++def step(message):
++    """A line the app's loading screen shows (session/LoadingState.kt reads "== STEP hh:mm:ss text")."""
++    print("== STEP %s %s" % (time.strftime("%H:%M:%S", time.gmtime()), message), flush=True)
++
++
++SIZE_MB = 626
++
++
++def download(url, tarball):
++    """curl, resuming a partial file; the size on disk is reported every few seconds."""
++    proc = subprocess.Popen(["curl", "-fL", "--retry", "5", "--retry-delay", "3", "-C", "-", "-sS",
++                             "-A", "droiddeck-proton-armv80", "-o", tarball, url])
++    said = -1
++    while proc.poll() is None:
++        time.sleep(3)
++        try:
++            done = os.path.getsize(tarball) >> 20
++        except OSError:
++            continue
++        if done != said:
++            said = done
++            step("downloading DroidDeck-Proton 11-12.8 for ARMv8.0: %d of %d MB" % (min(done, SIZE_MB), SIZE_MB))
++    return proc.returncode
++
++
+ def sha256_file(path):
+     h = hashlib.sha256()
+     with open(path, "rb") as f:
+@@ -132,15 +158,14 @@ def main():
+     else:
+         tarball = os.path.join(staging, "DroidDeck-Proton-11-12.8-aarch64.tar.gz")
+         if not (os.path.isfile(tarball) and sha256_file(tarball) == SHA256):
+-            log("downloading %s (626 MB, once)" % RELEASE)
+-            rc = subprocess.call(["curl", "-fL", "--retry", "5", "--retry-delay", "3", "-C", "-",
+-                                  "-A", "droiddeck-proton-armv80", "-o", tarball, URL])
++            log("downloading %s (626 MB, once; a partial download resumes)" % RELEASE)
++            rc = download(URL, tarball)
+             if rc != 0:
+                 raise SystemExit("droiddeck-proton-armv80: download failed (curl %d)" % rc)
+             if sha256_file(tarball) != SHA256:
+                 os.unlink(tarball)
+                 raise SystemExit("droiddeck-proton-armv80: the download did not match its checksum")
+-        log("unpacking (a few minutes)")
++        step("unpacking DroidDeck-Proton 11-12.8 (a few minutes)")
+         unpacked = os.path.join(staging, "unpacked")
+         shutil.rmtree(unpacked, ignore_errors=True)
+         os.makedirs(unpacked)
+@@ -149,7 +174,7 @@ def main():
+         os.rename(os.path.join(unpacked, RELEASE), tree)
+         shutil.rmtree(unpacked, ignore_errors=True)
+         os.unlink(tarball)
+-    log("rewriting %d files for this CPU" % len(entries))
++    step("installing DroidDeck-Proton 11-12.8 for ARMv8.0: rewriting %d files" % len(entries))
+     apply(tree, entries)
+     rename_tool(tree)
+     with open(os.path.join(tree, MARK), "w") as f:
+diff --git a/tools/tests/test_armv80_download_resume.py b/tools/tests/test_armv80_download_resume.py
+new file mode 100644
+index 0000000..098fba1
+--- /dev/null
++++ b/tools/tests/test_armv80_download_resume.py
+@@ -0,0 +1,81 @@
++"""droiddeck-proton-armv80 resumes an interrupted download (curl -C -) instead of starting over, reports the size
++on disk as it goes, and the result is byte-identical (the installer then checks its sha256)."""
++import hashlib
++import http.server
++import os
++from pathlib import Path
++import runpy
++import shutil
++import signal
++import subprocess
++import sys
++import tempfile
++import threading
++import time
++import unittest
++
++BIN = Path(__file__).resolve().parents[1] / 'linuxfs/overlay/usr/local/bin'
++INSTALLER = BIN / 'droiddeck-proton-armv80'
++
++
++class Ranges(http.server.BaseHTTPRequestHandler):
++    payload = b''
++    served = []
++
++    def log_message(self, *args):
++        pass
++
++    def do_GET(self):
++        start = 0
++        header = self.headers.get('Range')
++        if header and header.startswith('bytes='):
++            start = int(header[6:].split('-')[0])
++            self.send_response(206)
++            self.send_header('Content-Range', 'bytes %d-%d/%d' % (start, len(self.payload) - 1, len(self.payload)))
++        else:
++            self.send_response(200)
++        self.send_header('Content-Length', str(len(self.payload) - start))
++        self.end_headers()
++        Ranges.served.append(start)
++        for offset in range(start, len(self.payload), 128 * 1024):
++            try:
++                self.wfile.write(self.payload[offset:offset + 128 * 1024])
++                self.wfile.flush()
++            except (BrokenPipeError, ConnectionResetError):
++                return
++            time.sleep(0.05)
++
++
++@unittest.skipUnless(shutil.which('curl'), 'curl is needed')
++class DownloadResumeTest(unittest.TestCase):
++    def test_an_interrupted_download_resumes(self):
++        Ranges.payload = os.urandom(3 * 1024 * 1024)
++        Ranges.served = []
++        server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Ranges)
++        threading.Thread(target=server.serve_forever, daemon=True).start()
++        url = 'http://127.0.0.1:%d/proton.tar.gz' % server.server_address[1]
++        env = {k: v for k, v in os.environ.items() if k.lower() not in ('http_proxy', 'https_proxy', 'all_proxy')}
++        try:
++            with tempfile.TemporaryDirectory() as tmp:
++                tarball = os.path.join(tmp, 'proton.tar.gz')
++                code = ('import runpy,sys; g=runpy.run_path(%r); sys.exit(g["download"](%r, %r))' % (str(INSTALLER), url, tarball))
++                first = subprocess.Popen([sys.executable, '-c', code], env=env, start_new_session=True,
++                                         stdout=subprocess.PIPE, text=True)
++                time.sleep(0.8)
++                os.killpg(first.pid, signal.SIGKILL)
++                first.wait()
++                partial = os.path.getsize(tarball)
++                self.assertTrue(0 < partial < len(Ranges.payload), partial)
++                second = subprocess.run([sys.executable, '-c', code], env=env, capture_output=True, text=True, timeout=120)
++                self.assertEqual(second.returncode, 0, second.stderr)
++                data = Path(tarball).read_bytes()
++                self.assertEqual(hashlib.sha256(data).hexdigest(), hashlib.sha256(Ranges.payload).hexdigest())
++                self.assertEqual(Ranges.served[0], 0)
++                self.assertGreater(Ranges.served[-1], 0, 'the second request asked for the rest only')
++                self.assertRegex(second.stdout, r'== STEP \d\d:\d\d:\d\d downloading DroidDeck-Proton 11-12.8 for ARMv8.0: \d+ of 626 MB')
++        finally:
++            server.shutdown()
++
++
++if __name__ == '__main__':
++    unittest.main()
+-- 
+2.43.0
+
